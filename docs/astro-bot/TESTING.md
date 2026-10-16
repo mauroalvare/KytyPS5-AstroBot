@@ -58,7 +58,7 @@ presentation chain. Raw private captures are not bundled.
 - Monitor and haptics source translation units compile with clang-cl 19.1.5.
 
 The public portable layer independently passed 3 CPU suites (49 synthetic checks).
-The public kit passed 29 standalone CPU/file checks and 32 with real, verified offline
+The public kit passed 30 standalone CPU/file checks and 33 with real, verified offline
 archive extraction and the guarded rumble copy; no executable was started.
 
 Some investigation checks need a private game dump and are therefore evidence from the

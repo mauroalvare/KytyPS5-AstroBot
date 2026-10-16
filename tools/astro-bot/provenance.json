@@ -11,7 +11,7 @@
   "rumble_executable_sha256": "7881d6a791413ece6adf881de4871c921dadcfb5264f5f5e2db274519387246e",
   "game_sha256": "3b5100797fe83663e18a650f82f901d066acf1029ae80cfb1be638fe0839debd",
   "preset_sha256": "0eb46cd68fde8853aa635753c2489698fc91b9b1f5421948a1f2a14e7f46bab9",
-  "profile_index_sha256": "aaca3e1cc32eeb2c1ef136310747c7643bff8a7c4796c6a2f9c250f9f2ba7ec2",
+  "profile_index_sha256": "804056cb86a565ee9762706c35153a3d4465f732a671478095a8300774140159",
   "runtime_kind": "Pinned upstream Jetsku PGO release; NOT a rebuilt executable from this fork",
   "rumble_kind": "Optional six-byte guarded copy using the release existing PCM-envelope rumble path; not native fine haptics",
   "native_hdr": false,

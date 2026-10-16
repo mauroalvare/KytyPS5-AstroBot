@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 param([string]$ArchivePath,[string]$LayerInstallDirectory)
 # CPU/file-only regression suite. Never starts emulator, UI, GPU, audio or pads.
 $ErrorActionPreference='Stop'
@@ -8,6 +8,10 @@ $kit=Split-Path $PSScriptRoot -Parent
 $script:checks=0
 function Check {param([bool]$OK,[string]$Name) if(-not $OK){throw "FAIL: $Name"};$script:checks++}
 function Throws {param([scriptblock]$Action,[string]$Pattern,[string]$Name) $errorText=$null;try{& $Action | Out-Null}catch{$errorText=[string]$_};Check ($null -ne $errorText -and $errorText -match $Pattern) $Name}
+$hashInputs=@((Join-Path $kit 'preset.json'),(Join-Path $kit 'provenance.json'))+@(Get-ChildItem -LiteralPath (Join-Path $kit 'profiles') -Filter '*.json' | ForEach-Object FullName)
+$allLf=$true
+foreach($file in $hashInputs){if([IO.File]::ReadAllBytes($file) -contains 13){$allLf=$false}}
+Check $allLf 'Checksum-sensitive JSON stays LF across Windows Git checkouts'
 $case=Join-Path $PSScriptRoot ('generated\'+[guid]::NewGuid().ToString('N'))
 $source=Join-Path $case 'repo\tools\astro-bot'
 $null=New-Item -ItemType Directory -Path $source -Force
