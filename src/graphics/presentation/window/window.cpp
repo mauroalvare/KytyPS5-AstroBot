@@ -1,17 +1,15 @@
 #include "graphics/presentation/window.h"
 
-#include <SDL3/SDL.h>
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
-#include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -24,15 +22,16 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <SDL3/SDL.h>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fmt/format.h>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
-#include <filesystem>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
@@ -89,8 +88,7 @@ static Controller::Axis ControllerAxisFromSdl(int axis_id) {
 }
 
 static bool ControllerAxisIsTrigger(int axis_id) {
-	return axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ||
-	       axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
+	return axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
 }
 
 static int ControllerAxisValueFromSdl(int axis_id, int axis_value) {
@@ -182,7 +180,7 @@ static void ToggleDesktopFullscreen() {
 		return;
 	}
 
-	const auto flags = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
+	const auto flags      = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
 	const bool fullscreen = (flags & SDL_WINDOW_FULLSCREEN) != 0u;
 	if (!SDL_SetWindowFullscreen(g_window->window, !fullscreen)) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
@@ -334,8 +332,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	if (f.axis) {
 		const auto axis = ControllerAxisFromSdl(f.axis_id);
 		if (axis != Controller::Axis::AxisMax) {
-			Controller::SetAxis(f.id, axis,
-			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+			Controller::SetAxis(f.id, axis, ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}
 	}
 }
@@ -732,9 +729,8 @@ void WindowContext::ProcessEvent(double time_s) {
 				                      sensor.sensor == SDL_SENSOR_ACCEL ? Controller::Sensor::Accel
 				                                                        : Controller::Sensor::Gyro,
 				                      sensor.data,
-				                      sensor.sensor_timestamp != 0
-				                          ? sensor.sensor_timestamp / 1000
-				                          : sensor.timestamp / 1000);
+				                      sensor.sensor_timestamp != 0 ? sensor.sensor_timestamp / 1000
+				                                                   : sensor.timestamp / 1000);
 			}
 			break;
 		}
@@ -806,6 +802,44 @@ void WindowContext::Run() {
 	}
 }
 
+// KYTY_DISPLAY selects an SDL display by its one-based list index or exact name.
+// Resolve after video initialization and before creating any visible window.
+static SDL_DisplayID StartupDisplay() {
+	const char* requested = std::getenv("KYTY_DISPLAY");
+	if (requested == nullptr || *requested == '\0') {
+		return 0;
+	}
+	int            count    = 0;
+	SDL_DisplayID* displays = SDL_GetDisplays(&count);
+	if (displays == nullptr) {
+		LOGF("Startup display: enumeration failed: %s\n", SDL_GetError());
+		return 0;
+	}
+	char*               end      = nullptr;
+	const unsigned long number   = std::strtoul(requested, &end, 10);
+	SDL_DisplayID       selected = 0;
+	if (end != requested && *end == '\0' && number >= 1 &&
+	    number <= static_cast<unsigned long>(count)) {
+		selected = displays[number - 1];
+	} else {
+		for (int index = 0; index < count; ++index) {
+			const char* name = SDL_GetDisplayName(displays[index]);
+			if (name != nullptr && SDL_strcasecmp(requested, name) == 0) {
+				selected = displays[index];
+				break;
+			}
+		}
+	}
+	SDL_free(displays);
+	if (selected != 0) {
+		const char* name = SDL_GetDisplayName(selected);
+		LOGF("Startup display: %s (SDL id %u)\n", name != nullptr ? name : "unnamed", selected);
+	} else {
+		LOGF("Startup display: \"%s\" not found; using the default display\n", requested);
+	}
+	return selected;
+}
+
 static void WindowCreate(WindowContext& context) {
 	EXIT_IF(context.window != nullptr);
 	EXIT_IF(context.graphic_ctx.screen_width == 0);
@@ -834,7 +868,7 @@ static void WindowCreate(WindowContext& context) {
 	if (std::getenv("SDL_VULKAN_LIBRARY") == nullptr) {
 		if (const char* base_path = SDL_GetBasePath(); base_path != nullptr) {
 			const std::string base_path_str = base_path;
-			std::string moltenvk_path = base_path_str + "libMoltenVK.dylib";
+			std::string       moltenvk_path = base_path_str + "libMoltenVK.dylib";
 			if (!Common::File::IsFileExisting(moltenvk_path)) {
 				moltenvk_path = base_path_str + "../Frameworks/libMoltenVK.dylib";
 			}
@@ -852,13 +886,33 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
+	const SDL_DisplayID startup_display = StartupDisplay();
+	const bool          selected_fullscreen =
+	    startup_display != 0 && (window_flags & SDL_WINDOW_FULLSCREEN) != 0;
+	if (startup_display != 0) {
+		// Position while hidden and windowed, then enter fullscreen on that display.
+		// This avoids showing or switching a video mode on the default monitor first.
+		window_flags &= ~static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN);
+		window_flags |= static_cast<uint32_t>(SDL_WINDOW_HIDDEN);
+	}
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, width, height, window_flags);
 
 	if (context.window == nullptr) {
 		EXIT("%s\n", SDL_GetError());
 	}
 
-	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+	const int startup_position = startup_display != 0
+	                                 ? SDL_WINDOWPOS_CENTERED_DISPLAY(startup_display)
+	                                 : SDL_WINDOWPOS_CENTERED;
+	if (!SDL_SetWindowPosition(context.window, startup_position, startup_position)) {
+		LOGF("Startup display: could not position window: %s\n", SDL_GetError());
+	}
+	if (startup_display != 0) {
+		if (selected_fullscreen && !SDL_SetWindowFullscreen(context.window, true)) {
+			LOGF("Startup display: could not enter fullscreen: %s\n", SDL_GetError());
+		}
+		SDL_ShowWindow(context.window);
+	}
 	HostInputInit(context.window);
 	InitializeSystemOverlayInput(context.window);
 	context.UpdateIcon();
@@ -958,8 +1012,8 @@ static void WindowLoadPngIcon(const std::filesystem::path& path, WindowIcon* ico
 
 	EXIT_IF(icon->pixels == nullptr);
 
-	icon->surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, icon->pixels,
-	                                      width * 4);
+	icon->surface =
+	    SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, icon->pixels, width * 4);
 	EXIT_NOT_IMPLEMENTED(icon->surface == nullptr);
 }
 
@@ -1000,7 +1054,7 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 #endif
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
-	auto text = fmt::format(
+	auto        text        = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
