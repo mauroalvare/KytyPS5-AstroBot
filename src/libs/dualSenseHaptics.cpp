@@ -10,6 +10,8 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <vector>
 
@@ -40,7 +42,16 @@ std::map<int, int> g_speaker_streams;
 
 // Where pad speaker and vibration audio goes, for the console diagnostics: printed when it
 // changes, per port kind, so a 2-second device recheck does not repeat it.
-enum class Route { Unknown, NoWiredPad, NoUsbDevice, Usb, UsbFailed, Bluetooth, BluetoothFailed };
+enum class Route {
+	Unknown,
+	NoWiredPad,
+	NoUsbDevice,
+	Usb,
+	UsbFailed,
+	Bluetooth,
+	BluetoothFailed,
+	Rumble
+};
 std::atomic<Route> g_reported_route[2] {Route::Unknown, Route::Unknown};
 
 void ReportRoute(const Stream* stream, Route route, const char* detail) {
@@ -60,6 +71,9 @@ void ReportRoute(const Stream* stream, Route route, const char* detail) {
 		case Route::UsbFailed: text = "USB audio device failed to open"; break;
 		case Route::Bluetooth: text = "Bluetooth HID audio"; break;
 		case Route::BluetoothFailed: text = "Bluetooth HID audio failed to open"; break;
+		case Route::Rumble:
+			text = "compatible rumble from PCM envelope (fine audio haptics disabled)";
+			break;
 		case Route::Unknown: break;
 	}
 	Libs::Audio::Diag::Print("DualSense %s audio (controller %d, %u Hz): %s%s%s",
@@ -210,12 +224,11 @@ SDL_AudioDeviceID FindDevice() {
 	for (int i = 0; i < count; i++) {
 		const char*   name = SDL_GetAudioDeviceName(devices[i]);
 		SDL_AudioSpec spec {};
-		const bool is_dualsense_name =
-		    name != nullptr &&
-		    (SDL_strcasestr(name, "DualSense") != nullptr ||
-		     SDL_strcasestr(name, "Wireless Controller") != nullptr);
-		if (is_dualsense_name &&
-		    SDL_GetAudioDeviceFormat(devices[i], &spec, nullptr) && spec.channels == 4) {
+		const bool    is_dualsense_name =
+		    name != nullptr && (SDL_strcasestr(name, "DualSense") != nullptr ||
+		                        SDL_strcasestr(name, "Wireless Controller") != nullptr);
+		if (is_dualsense_name && SDL_GetAudioDeviceFormat(devices[i], &spec, nullptr) &&
+		    spec.channels == 4) {
 			if (device != 0) {
 				device = 0; // Multiple matching endpoints cannot be associated reliably either.
 				break;
@@ -351,6 +364,17 @@ bool UsesBluetooth(const Stream* stream) {
 	return stream != nullptr && stream->bluetooth != nullptr;
 }
 
+static bool ForceRumbleEnvelope() {
+	// An explicit fallback for USB endpoints that accept PCM without moving the
+	// actuators. This changes vibration ports only; gyro, triggers and input retain
+	// the ordinary DualSense path. Default behavior remains native fine haptics.
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DUALSENSE_HAPTICS");
+		return value != nullptr && std::strcmp(value, "rumble") == 0;
+	}();
+	return enabled;
+}
+
 uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames, uint32_t channels,
                bool is_float, const int* volume, float gain, const float* gains) {
 	if (stream == nullptr || data == nullptr || frames == 0 || channels == 0 || volume == nullptr) {
@@ -364,16 +388,22 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 		return 0;
 	}
 
-	if (!stream->speaker &&
-		SDL_GetGamepadTypeForID(static_cast<SDL_JoystickID>(controller)) != SDL_GAMEPAD_TYPE_PS5) {
+	if (!stream->speaker && (ForceRumbleEnvelope() ||
+	                         SDL_GetGamepadTypeForID(static_cast<SDL_JoystickID>(controller)) !=
+	                             SDL_GAMEPAD_TYPE_PS5)) {
+		if (ForceRumbleEnvelope()) {
+			stream->controller = controller;
+			ReportRoute(stream, Route::Rumble, nullptr);
+		}
 		float peak[2] = {0.0f, 0.0f};
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			for (uint32_t ch = 0; ch < 2; ch++) {
 				const auto src_ch = channels == 1 ? 0 : ch;
 				const auto index  = (static_cast<size_t>(first_frame) + frame) * channels + src_ch;
 				float      value  = is_float ? static_cast<const float*>(data)[index]
-											: static_cast<const int16_t*>(data)[index] / 32768.0f;
-				value *= volume[src_ch] / 32768.0f * gain * (gains != nullptr ? gains[src_ch] : 1.0f);
+				                             : static_cast<const int16_t*>(data)[index] / 32768.0f;
+				value *=
+				    volume[src_ch] / 32768.0f * gain * (gains != nullptr ? gains[src_ch] : 1.0f);
 				peak[ch] = std::max(peak[ch], std::fabs(value));
 			}
 		}
@@ -381,13 +411,14 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 			return static_cast<uint16_t>(std::clamp(v * 2.0f, 0.0f, 1.0f) * 65535.0f);
 		};
 		SDL_LockJoysticks();
-		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller)); pad != nullptr) {
+		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller));
+		    pad != nullptr) {
 			(void)SDL_RumbleGamepad(pad, to_motor(peak[0]), to_motor(peak[1]), 100);
 		}
 		SDL_UnlockJoysticks();
 		return static_cast<uint64_t>(frames) * 1000000 / stream->freq;
 	}
-	
+
 	const bool wireless = IsWireless(controller);
 	if (!wireless && !CanUseDevice(controller)) {
 		CloseDevice(stream);
