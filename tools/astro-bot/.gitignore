@@ -1,0 +1,8 @@
+.local/
+runtime/
+*.zip
+frame-layer/*.dll
+frame-layer/*.pdb
+frame-layer/*.lib
+frame-layer/*.exp
+tests/generated/

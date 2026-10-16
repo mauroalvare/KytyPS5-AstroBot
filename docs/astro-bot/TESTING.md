@@ -57,6 +57,10 @@ presentation chain. Raw private captures are not bundled.
   transform. The cache itself is not distributed; this was not a new speed improvement.
 - Monitor and haptics source translation units compile with clang-cl 19.1.5.
 
+The public portable layer independently passed 3 CPU suites (49 synthetic checks).
+The public kit passed 29 standalone CPU/file checks and 32 with real, verified offline
+archive extraction and the guarded rumble copy; no executable was started.
+
 Some investigation checks need a private game dump and are therefore evidence from the
 local investigation, not all self-contained tests in this public checkout. Public kit
 and presentation tests are documented separately in the build guide.

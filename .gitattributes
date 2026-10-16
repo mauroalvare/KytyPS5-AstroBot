@@ -1,0 +1,3 @@
+# Version-locked profile/preset hashes must survive Windows Git checkouts.
+tools/astro-bot/** text eol=lf
+tools/astro-bot/*.cmd text eol=crlf

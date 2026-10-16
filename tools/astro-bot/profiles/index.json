@@ -1,0 +1,311 @@
+{
+  "game_sha256": "3B5100797FE83663E18A650F82F901D066ACF1029AE80CFB1BE638FE0839DEBD",
+  "status": "STATICALLY_VALIDATED_NOT_GAME_TESTED",
+  "validation": [
+    "full game SHA256",
+    "original bytes",
+    "complete instructions",
+    "scalar RIP relocations",
+    "incoming FPS-block and TV-rate branches",
+    "no overlapping writes"
+  ],
+  "frame_rate_contract": "For 90/120 FPS experiments, emulator vblank frequency must exactly match the patched rate; output FPS and game speed remain unverified.",
+  "runtime_checks_pending": [
+    "actual render resolution",
+    "projection and HUD",
+    "game speed",
+    "audio synchronization",
+    "frame times",
+    "crashes"
+  ],
+  "profiles": [
+    {
+      "file": "PPSA21564_01.007.000_nonRT_native_60fps.json",
+      "dimensions": null,
+      "vblank": 60,
+      "lighting": "nonRT",
+      "writes": 2,
+      "aspect": "16:9",
+      "sha256": "38014f97cd722c245cac4c241e743b96f1da07f182805e5e4b7847a84a8beaa4"
+    },
+    {
+      "file": "PPSA21564_01.007.000_nonRT_native_90fps.json",
+      "dimensions": null,
+      "vblank": 90,
+      "lighting": "nonRT",
+      "writes": 9,
+      "aspect": "16:9",
+      "sha256": "c0a5ca9d0b5f95e226c67f87a615e2f9e9b303dc04da8150fefa2146950411c2"
+    },
+    {
+      "file": "PPSA21564_01.007.000_nonRT_native_120fps.json",
+      "dimensions": null,
+      "vblank": 120,
+      "lighting": "nonRT",
+      "writes": 9,
+      "aspect": "16:9",
+      "sha256": "88c3c4eaf569a44cb67d2dac3f7108378ad80d1e8097fee6bdc5d21acfb3093b"
+    },
+    {
+      "file": "PPSA21564_01.007.000_nonRT_2560x1440_60fps.json",
+      "dimensions": [
+        2560,
+        1440
+      ],
+      "vblank": 60,
+      "lighting": "nonRT",
+      "writes": 12,
+      "aspect": "16:9",
+      "sha256": "73214de1267348fe584b7100db4bb70cd18993c65e15c3c734a4f1aba2ed8cd0"
+    },
+    {
+      "file": "PPSA21564_01.007.000_nonRT_2560x1440_90fps.json",
+      "dimensions": [
+        2560,
+        1440
+      ],
+      "vblank": 90,
+      "lighting": "nonRT",
+      "writes": 19,
+      "aspect": "16:9",
+      "sha256": "7dcf8ca1e43a32b4bbe1cb452cdd16dc341fd0a6c036f98f47b3f286f63137d0"
+    },
+    {
+      "file": "PPSA21564_01.007.000_nonRT_2560x1440_120fps.json",
+      "dimensions": [
+        2560,
+        1440
+      ],
+      "vblank": 120,
+      "lighting": "nonRT",
+      "writes": 19,
+      "aspect": "16:9",
+      "sha256": "804aeb43379b3bc5d94000392a19fdfc69a18582153fa141c9b15ae4f093225e"
+    },
+    {
+      "file": "PPSA21564_01.007.000_nonRT_3440x1440_60fps.json",
+      "dimensions": [
+        3440,
+        1440
+      ],
+      "vblank": 60,
+      "lighting": "nonRT",
+      "writes": 12,
+      "aspect": "source",
+      "sha256": "419a09720f8bd7867ee309f034dfa3264f70c03eaa92e2844a6cadc010ed766e"
+    },
+    {
+      "file": "PPSA21564_01.007.000_nonRT_3440x1440_90fps.json",
+      "dimensions": [
+        3440,
+        1440
+      ],
+      "vblank": 90,
+      "lighting": "nonRT",
+      "writes": 19,
+      "aspect": "source",
+      "sha256": "b75cefdf35fab9726cfbe113e5782fbb0217932d9dfead0ecb032a6cccdbea0d"
+    },
+    {
+      "file": "PPSA21564_01.007.000_nonRT_3440x1440_120fps.json",
+      "dimensions": [
+        3440,
+        1440
+      ],
+      "vblank": 120,
+      "lighting": "nonRT",
+      "writes": 19,
+      "aspect": "source",
+      "sha256": "b583eafc99967c545cf7b4c3f494fcc666b75b28a0321c6aa0653ee79e4fc1c8"
+    },
+    {
+      "file": "PPSA21564_01.007.000_deferredGI_native_60fps.json",
+      "dimensions": null,
+      "vblank": 60,
+      "lighting": "deferredGI",
+      "writes": 1,
+      "aspect": "16:9",
+      "sha256": "5791e5e4513df729f6f016af4c2d653026b86dc9d53533619f4a8113e4621803"
+    },
+    {
+      "file": "PPSA21564_01.007.000_deferredGI_native_90fps.json",
+      "dimensions": null,
+      "vblank": 90,
+      "lighting": "deferredGI",
+      "writes": 8,
+      "aspect": "16:9",
+      "sha256": "11eff9d07dea14e03ac54119cbc07af03a21845b4b36848fcccba7bda2469a83"
+    },
+    {
+      "file": "PPSA21564_01.007.000_deferredGI_native_120fps.json",
+      "dimensions": null,
+      "vblank": 120,
+      "lighting": "deferredGI",
+      "writes": 8,
+      "aspect": "16:9",
+      "sha256": "044cfce350528fa3b9dcece9b7cad6b8b701e9f763d102e7f02969738aba169b"
+    },
+    {
+      "file": "PPSA21564_01.007.000_deferredGI_2560x1440_60fps.json",
+      "dimensions": [
+        2560,
+        1440
+      ],
+      "vblank": 60,
+      "lighting": "deferredGI",
+      "writes": 11,
+      "aspect": "16:9",
+      "sha256": "cfc95ab72f6d9dc67a47fdde1f1acc88e45a8bc69f3a84a4a33652143cad5d8d"
+    },
+    {
+      "file": "PPSA21564_01.007.000_deferredGI_2560x1440_90fps.json",
+      "dimensions": [
+        2560,
+        1440
+      ],
+      "vblank": 90,
+      "lighting": "deferredGI",
+      "writes": 18,
+      "aspect": "16:9",
+      "sha256": "52229244883276e9d29229eb0439f6e3196b5609414454d2a3b86de594eae586"
+    },
+    {
+      "file": "PPSA21564_01.007.000_deferredGI_2560x1440_120fps.json",
+      "dimensions": [
+        2560,
+        1440
+      ],
+      "vblank": 120,
+      "lighting": "deferredGI",
+      "writes": 18,
+      "aspect": "16:9",
+      "sha256": "cd64847590386efe67658b6375844cb04489893f50b30105446efa5d3aebfce6"
+    },
+    {
+      "file": "PPSA21564_01.007.000_deferredGI_3440x1440_60fps.json",
+      "dimensions": [
+        3440,
+        1440
+      ],
+      "vblank": 60,
+      "lighting": "deferredGI",
+      "writes": 11,
+      "aspect": "source",
+      "sha256": "39d0120399c8e9f477a24c47bc28e218e3eb8dd04d215cfc471dd09e49173f3f"
+    },
+    {
+      "file": "PPSA21564_01.007.000_deferredGI_3440x1440_90fps.json",
+      "dimensions": [
+        3440,
+        1440
+      ],
+      "vblank": 90,
+      "lighting": "deferredGI",
+      "writes": 18,
+      "aspect": "source",
+      "sha256": "395943d3879d22671245a9454c493d815b2084b8e7adc68f1d0fcb529f57b7c4"
+    },
+    {
+      "file": "PPSA21564_01.007.000_deferredGI_3440x1440_120fps.json",
+      "dimensions": [
+        3440,
+        1440
+      ],
+      "vblank": 120,
+      "lighting": "deferredGI",
+      "writes": 18,
+      "aspect": "source",
+      "sha256": "354bf6eb9138a437f9ac23e4244b4d1201b3aedcb3de34a52adc1c038e6798aa"
+    },
+    {
+      "file": "PPSA21564_01.007.000_originalLighting_native_90fps.json",
+      "dimensions": null,
+      "vblank": 90,
+      "lighting": "originalLighting",
+      "writes": 7,
+      "aspect": "16:9",
+      "sha256": "6a47d11e50baaff474e71c63540ee0d54c716e6f6f389203b9cd45a46f5d4067"
+    },
+    {
+      "file": "PPSA21564_01.007.000_originalLighting_native_120fps.json",
+      "dimensions": null,
+      "vblank": 120,
+      "lighting": "originalLighting",
+      "writes": 7,
+      "aspect": "16:9",
+      "sha256": "51238c1d1ed077dbc17da5e7299aba24a4c91e11b5cf204e887c0cb79ad51951"
+    },
+    {
+      "file": "PPSA21564_01.007.000_originalLighting_2560x1440_60fps.json",
+      "dimensions": [
+        2560,
+        1440
+      ],
+      "vblank": 60,
+      "lighting": "originalLighting",
+      "writes": 10,
+      "aspect": "16:9",
+      "sha256": "24addfef82ce9160688a26053a4fdf214881dd4a1dc1b69a0674840dab24306b"
+    },
+    {
+      "file": "PPSA21564_01.007.000_originalLighting_2560x1440_90fps.json",
+      "dimensions": [
+        2560,
+        1440
+      ],
+      "vblank": 90,
+      "lighting": "originalLighting",
+      "writes": 17,
+      "aspect": "16:9",
+      "sha256": "c2f1e1798b17203d4ff09b07cb2baea8f5c3fa2303d09009c58e95fb9fa3e6f1"
+    },
+    {
+      "file": "PPSA21564_01.007.000_originalLighting_2560x1440_120fps.json",
+      "dimensions": [
+        2560,
+        1440
+      ],
+      "vblank": 120,
+      "lighting": "originalLighting",
+      "writes": 17,
+      "aspect": "16:9",
+      "sha256": "df8c69763c9e156a12933c1a9a7ab176436010c6987fb3a89fd74b11d9405dfb"
+    },
+    {
+      "file": "PPSA21564_01.007.000_originalLighting_3440x1440_60fps.json",
+      "dimensions": [
+        3440,
+        1440
+      ],
+      "vblank": 60,
+      "lighting": "originalLighting",
+      "writes": 10,
+      "aspect": "source",
+      "sha256": "c28b0840380a2df267a00eb729b3749c46950315674dc5d845ac0290df34498f"
+    },
+    {
+      "file": "PPSA21564_01.007.000_originalLighting_3440x1440_90fps.json",
+      "dimensions": [
+        3440,
+        1440
+      ],
+      "vblank": 90,
+      "lighting": "originalLighting",
+      "writes": 17,
+      "aspect": "source",
+      "sha256": "7ba512e03960d212a429b453a88168929e267ab9d3805744230902f9868a5658"
+    },
+    {
+      "file": "PPSA21564_01.007.000_originalLighting_3440x1440_120fps.json",
+      "dimensions": [
+        3440,
+        1440
+      ],
+      "vblank": 120,
+      "lighting": "originalLighting",
+      "writes": 17,
+      "aspect": "source",
+      "sha256": "56fd291f43c2e39b08af81806a69eb624b7d8454efe6b289c176d70b9ee15d8d"
+    }
+  ]
+}

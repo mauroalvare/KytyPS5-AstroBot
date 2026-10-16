@@ -59,12 +59,19 @@ jobs:
           cmake --install _Build/astro-tools
           if ($LASTEXITCODE -ne 0) { throw 'Standalone tool installation failed.' }
 
+      - name: Check portable scripts without starting the game
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tools/astro-bot/tests/Test-AstroBotKit.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Portable script checks failed.' }
+
       - name: Package the tool overlay only
         shell: pwsh
         run: |
           & ./tools/astro-bot/Package-AstroBot.ps1 `
             -OutputDirectory "$env:RUNNER_TEMP/astro-tool-overlay" `
             -LayerInstallDirectory "$env:RUNNER_TEMP/astro-layer-install" `
+            -SourceCommit $env:GITHUB_SHA `
             -ArchivePath "$env:RUNNER_TEMP/AstroBot-Tools-Windows-x64.zip"
 
       - name: Upload the tool overlay

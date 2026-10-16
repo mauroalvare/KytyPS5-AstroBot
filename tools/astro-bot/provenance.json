@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "repository": "https://github.com/mauroalvare/KytyPS5-AstroBot",
+  "base_repository": "https://github.com/Jetsku/KytyPS5",
+  "base_commit": "28bc20f146a276479acf42d2e405fb46a4491b8e",
+  "base_source_url": "https://github.com/Jetsku/KytyPS5/tree/28bc20f146a276479acf42d2e405fb46a4491b8e",
+  "release_url": "https://github.com/Jetsku/KytyPS5/releases/tag/u59-windows-20261013-int19.1",
+  "archive_url": "https://github.com/Jetsku/KytyPS5/releases/download/u59-windows-20261013-int19.1/KytyPS5-U59-Windows-x64.zip",
+  "archive_sha256": "9ec5f56ee62a21f86004fd789200a83820431fd05fa97093e7d839011a70e2ff",
+  "release_executable_sha256": "74e34635d3b8b426b20b9c2e0172aee87f76fede0c11001da959f1b8ecabab34",
+  "rumble_executable_sha256": "7881d6a791413ece6adf881de4871c921dadcfb5264f5f5e2db274519387246e",
+  "game_sha256": "3b5100797fe83663e18a650f82f901d066acf1029ae80cfb1be638fe0839debd",
+  "preset_sha256": "0eb46cd68fde8853aa635753c2489698fc91b9b1f5421948a1f2a14e7f46bab9",
+  "profile_index_sha256": "aaca3e1cc32eeb2c1ef136310747c7643bff8a7c4796c6a2f9c250f9f2ba7ec2",
+  "runtime_kind": "Pinned upstream Jetsku PGO release; NOT a rebuilt executable from this fork",
+  "rumble_kind": "Optional six-byte guarded copy using the release existing PCM-envelope rumble path; not native fine haptics",
+  "native_hdr": false,
+  "shader_replacements": false,
+  "default": "Stable: native/dynamic game resolution, nonRT, 60 Hz virtual vblank, native controller route",
+  "experiments": [
+    "1440p fixed rendering",
+    "90/120 frame-rate settings",
+    "ultrawide projection/HUD",
+    "deferred GI",
+    "conventional rumble fallback"
+  ],
+  "runtime_pending": [
+    "performance across scenes",
+    "120 FPS and game speed",
+    "ultrawide projection and HUD",
+    "controller response on other systems"
+  ]
+}
