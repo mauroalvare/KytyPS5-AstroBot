@@ -1,0 +1,75 @@
+name: Astro Bot tool overlay
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tools/astro-bot/**'
+      - '.github/workflows/astro-tools.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: astro-tools-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-tool-overlay:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Set up the x64 developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Initialize only Vulkan headers
+        shell: pwsh
+        run: |
+          git submodule update --init --depth 1 3rdparty/Vulkan-Headers
+          if ($LASTEXITCODE -ne 0) { throw 'Vulkan-Headers initialization failed.' }
+
+      - name: Configure the standalone tools
+        shell: pwsh
+        run: |
+          $clang = Join-Path $env:ProgramFiles 'LLVM\bin\clang-cl.exe'
+          if (-not (Test-Path -LiteralPath $clang)) {
+            $clang = (Get-Command clang-cl -ErrorAction Stop).Source
+          }
+          & $clang --version
+          cmake -S tools/astro-bot/frame-layer -B _Build/astro-tools -G Ninja `
+            "-DCMAKE_CXX_COMPILER=$clang" -DCMAKE_BUILD_TYPE=Release `
+            -DASTRO_FRAME_BUILD_CPU_TESTS=ON -DASTRO_FRAME_BUILD_GPU_TESTS=OFF `
+            "-DCMAKE_INSTALL_PREFIX=$env:RUNNER_TEMP/astro-layer-install"
+          if ($LASTEXITCODE -ne 0) { throw 'Standalone tool configuration failed.' }
+
+      - name: Build and run CPU checks
+        shell: pwsh
+        run: |
+          cmake --build _Build/astro-tools --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Standalone tool build failed.' }
+          ctest --test-dir _Build/astro-tools --output-on-failure -L cpu
+          if ($LASTEXITCODE -ne 0) { throw 'CPU checks failed.' }
+          cmake --install _Build/astro-tools
+          if ($LASTEXITCODE -ne 0) { throw 'Standalone tool installation failed.' }
+
+      - name: Package the tool overlay only
+        shell: pwsh
+        run: |
+          & ./tools/astro-bot/Package-AstroBot.ps1 `
+            -OutputDirectory "$env:RUNNER_TEMP/astro-tool-overlay" `
+            -LayerInstallDirectory "$env:RUNNER_TEMP/astro-layer-install" `
+            -ArchivePath "$env:RUNNER_TEMP/AstroBot-Tools-Windows-x64.zip"
+
+      - name: Upload the tool overlay
+        uses: actions/upload-artifact@v4
+        with:
+          name: AstroBot-Tools-Windows-x64
+          path: ${{ runner.temp }}/AstroBot-Tools-Windows-x64.zip
+          if-no-files-found: error
