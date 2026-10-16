@@ -1,0 +1,61 @@
+name: Astro Bot preview result
+description: Report this fork's experimental Astro Bot kit, not an unmodified upstream build.
+title: "[ASTRO PREVIEW]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing reports first. Start with Stable and one change at a time.
+        Do not attach game files, saves, shader caches or credentials. Review logs for personal paths.
+  - type: input
+    id: build
+    attributes:
+      label: Exact kit tag / source commit and profile
+      placeholder: "astro-bot-preview-2026-10-16, Stable, Native haptics"
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Game ID, version and supported executable hash match
+      placeholder: "PPSA21564, 01.007.000; hash check passed"
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: OS, CPU, GPU/driver, RAM/VRAM and controller connection
+    validations:
+      required: true
+  - type: dropdown
+    id: status
+    attributes:
+      label: Furthest consistent status
+      options:
+        - Doesn't boot
+        - Logo
+        - Main menu
+        - In game
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps, scene and camera
+      description: Include busy versus sky views and first versus repeated visits when relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Actual and expected result
+      description: Include FPS, slow motion, pauses, crashes, audio, image/HUD and controller feedback.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Complete log and optional frame-time capture / screenshots
+      description: Attach the complete log; remove personal information deliberately and say what was redacted.
+    validations:
+      required: true

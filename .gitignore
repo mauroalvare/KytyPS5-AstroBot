@@ -29,3 +29,19 @@ _Textures/
 *.pdb
 *.nsys-rep
 *.ngfx-gputrace
+
+# Local Astro testing data must never enter source or release assets.
+_SaveData/
+_Trophies/
+_DownloadData/
+_TempData/
+_Textures/
+_kyty.txt
+*.profraw
+*.profdata
+tools/astro-bot/runtime/
+tools/astro-bot/local-config.json
+tools/astro-bot/logs/
+tools/astro-bot/dist/
+tools/astro-bot/frame-layer/build*/
+__pycache__/
