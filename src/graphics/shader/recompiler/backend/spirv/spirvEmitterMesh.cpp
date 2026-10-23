@@ -255,7 +255,7 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				vertex[component] = state.builder.AllocateId();
 				state.builder.AddFunction(
 				    spv::OpBitFieldUExtract, TypeU32(state), vertex[component], packed,
-				    ConstantU32(state, component * 10u), ConstantU32(state, 10));
+				    ConstantU32(state, component * 10u), ConstantU32(state, 9));
 			}
 			uint32_t out_of_range = 0;
 			if (guard) {
