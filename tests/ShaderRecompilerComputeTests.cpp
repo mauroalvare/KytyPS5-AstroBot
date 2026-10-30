@@ -52915,8 +52915,10 @@ void CheckEmbeddedFetchVertexOffset() {
     return ResolveDrawOffsets(0, vertex).second;
   };
 
+  // Packed integer formats load integers too.
   for (const auto format : {Prospero::BufferFormat::k32_32_32_32Float,
-                            Prospero::BufferFormat::k32_32_32_32UInt}) {
+                            Prospero::BufferFormat::k32_32_32_32UInt,
+                            Prospero::BufferFormat::k10_10_10_2UInt}) {
     const auto local = Compile("LocalEmbeddedFetch", MakeFetch({}, {}, 0, false, true),
                                0, ShaderType::Local, format);
     ValidateSpirv("LocalEmbeddedFetch", local.spirv);
@@ -52925,7 +52927,7 @@ void CheckEmbeddedFetchVertexOffset() {
               return input.kind == ShaderRecompiler::IR::StageInputKind::Parameter &&
                      input.location == 0;
             }), "LS indexed fetch must consume native vertex attributes");
-    if (format == Prospero::BufferFormat::k32_32_32_32UInt) {
+    if (format != Prospero::BufferFormat::k32_32_32_32Float) {
       spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
       std::string assembly;
       Require("LocalEmbeddedFetch", "disassembly", tools.Disassemble(local.spirv, &assembly),
