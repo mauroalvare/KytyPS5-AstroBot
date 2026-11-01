@@ -2015,6 +2015,17 @@ void TestDisabledDebugBranches() {
   }
 }
 
+void TestOrderedPsDoneEndsProgram() {
+  using namespace ShaderRecompiler;
+  // Captured PPSA05366 POPS pixel shaders end in s_endpgm_ordered_ps_done, padded to 16 bytes.
+  const std::array shader = {EncodeSopp(0x1e), 0u, 0u, 0u};
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  Check(decoded.instructions.size() == 1u &&
+            decoded.instructions.front().opcode == Decoder::Opcode::S_ENDPGM,
+        "s_endpgm_ordered_ps_done did not end the program");
+}
+
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
   const uint32_t shader[] = {
       EncodeSMovB32(2, 135),         // s2 = 7
@@ -16278,6 +16289,7 @@ int main(int argc, char **argv) {
   TestCapturedBufferAtomicsX2();
   TestWaveRowReduction();
   TestDisabledDebugBranches();
+  TestOrderedPsDoneEndsProgram();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerImageQueryTranslation();
   TestNewShaderRecompilerBranchConditionForms();
