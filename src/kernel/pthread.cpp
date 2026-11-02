@@ -2243,12 +2243,6 @@ int KYTY_SYSV_ABI PthreadAttrGetinheritsched(const PthreadAttr* attr, int* inher
 
 	*inherit_sched = (*attr)->inherit_sched;
 
-	switch (*inherit_sched) {
-		case 0:
-		case 4: break;
-		default: EXIT("unknown inherit_sched: %d\n", *inherit_sched);
-	}
-
 	return OK;
 }
 
@@ -2402,10 +2396,9 @@ int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sche
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int pinherit_sched = PTHREAD_INHERIT_SCHED;
 	switch (inherit_sched) {
-		case 0: pinherit_sched = PTHREAD_EXPLICIT_SCHED; break;
-		case 4: pinherit_sched = PTHREAD_INHERIT_SCHED; break;
+		case 0:
+		case 4: break;
 		default: EXIT("unknown inherit_sched: %d\n", inherit_sched);
 	}
 
@@ -2413,7 +2406,6 @@ int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sche
 	// behavior, and some guest attr flows can leave the native attr in a shape that crashes inside
 	// winpthreads.
 	attr_value->inherit_sched = inherit_sched;
-	(void)pinherit_sched;
 
 	return OK;
 }
