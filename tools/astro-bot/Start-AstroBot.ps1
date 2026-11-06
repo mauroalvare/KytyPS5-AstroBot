@@ -5,6 +5,7 @@ param(
  [ValidateSet('Native','Compatible')][string]$Vibration='Native',
  [string]$SourceExecutable,
  [string]$Display,
+ [ValidateRange(1,4)][int]$CommandBufferScale=0,
  [switch]$Windowed,
  [switch]$Diagnostics,
  [switch]$PrepareOnly
@@ -38,6 +39,7 @@ if($SourceExecutable){
  $runtimeKind='User-supplied source build; not verified as the pinned upstream PGO release'
 }else{
  if($Display){throw '-Display requires a source build with KYTY_DISPLAY support; the pinned PGO release has no monitor selector.'}
+ if($CommandBufferScale -gt 0){throw '-CommandBufferScale requires a source build of this fork; the pinned PGO release scales only PPSA21567 01.018.000.'}
  $exeName=if($Vibration -eq 'Compatible'){'kyty_emulator_rumble.exe'}else{'kyty_emulator.exe'}
  $exe=Join-Path $runtime $exeName
  $expectedExeHash=if($Vibration -eq 'Compatible'){$info.rumble_executable_sha256}else{$info.release_executable_sha256}
@@ -63,6 +65,9 @@ $environment['SDL_JOYSTICK_ENHANCED_REPORTS']='1'
 $environment['SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS']='1'
 if($Vibration -eq 'Compatible'){$environment['KYTY_DUALSENSE_HAPTICS']='rumble'}
 if($Display){$environment['KYTY_DISPLAY']=$Display}
+# An explicit scale opts PPSA21564 01.007.000 in to the signature-checked command buffer
+# table scan (src/loader/gamePatch.cpp); 1 turns the built-in scale off.
+if($CommandBufferScale -gt 0){$environment['KYTY_ASTRO_CB_SCALE']=[string]$CommandBufferScale}
 $environment['VK_LAYER_PATH']=Join-Path $PSScriptRoot 'frame-layer'
 $environment['VK_INSTANCE_LAYERS']='VK_LAYER_ASTRO_frame'
 $environment['ASTRO_FRAME_ASPECT']=$selected.Aspect
@@ -75,7 +80,7 @@ $quoted=ConvertTo-AstroCommandLine $arguments
 $plan=[pscustomobject]@{
  Mode=$Mode;Experimental=$selected.Experimental;Resolution=$selected.Resolution;RequestedRate=$selected.Rate;Vblank=$selected.Rate
  Emulator=$exe;ExecutableSha256=$exeHash;RuntimeKind=$runtimeKind;GamePath=$game;WorkingDirectory=$runtime
- Patch=$patch;ExpectedMods=$expectedMods;Fullscreen=(-not $Windowed);Aspect=$selected.Aspect;Vibration=$Vibration
+ Patch=$patch;ExpectedMods=$expectedMods;Fullscreen=(-not $Windowed);Aspect=$selected.Aspect;Vibration=$Vibration;CommandBufferScale=$CommandBufferScale
  Arguments=$arguments;QuotedArguments=$quoted;Environment=$environment;ProcessStarted=$false;RuntimeVerified=$false;PatchVerification='not started'
 }
 # This branch performs only reads and returns JSON. It creates no directories,

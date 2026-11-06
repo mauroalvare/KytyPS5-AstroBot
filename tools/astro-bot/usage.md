@@ -25,11 +25,14 @@ The example folder is illustrative. It must contain `eboot.bin` for PPSA21564
 Other versions are rejected. A successful launch remembers the folder only in
 `.local/settings.json`; later launches can use `Play-AstroBot.cmd`.
 
-Setup downloads the exact [Jetsku U59 int19.1 release](https://github.com/Jetsku/KytyPS5/releases/tag/u59-windows-20261013-int19.1)
+Setup downloads the exact [Jetsku U59 int21 release](https://github.com/Jetsku/KytyPS5/releases/tag/u59-windows-20261024-int21)
 and checks its ZIP SHA256 before extracting into `runtime/`.
 This is the existing upstream PGO executable, **not a rebuilt PGO binary from this
 fork**. `provenance.json` pins the URL, ZIP and executable hashes and the exact
-[source base](https://github.com/Jetsku/KytyPS5/tree/28bc20f146a276479acf42d2e405fb46a4491b8e).
+[source base](https://github.com/Jetsku/KytyPS5/tree/744705ee1df4b0acb1af382ff5c32ca4a20aa5f7).
+An older kit's `runtime/` (int19.1) fails the new hash check; run setup again and it
+replaces the runtime. The int21 pipeline key changed, so the first launch rebuilds
+shader and pipeline caches and can stutter for a few minutes.
 No global Vulkan layer registration, drivers or Windows settings are changed.
 
 To reuse a previously downloaded matching archive:
@@ -127,6 +130,21 @@ PGO patch. The launcher records it as a user-supplied build and does not claim i
 matches the pinned PGO release. `-Display` is available only for source builds with
 `KYTY_DISPLAY` support; use an exact SDL monitor name or its one-based list index.
 No hardcoded monitor-ID binary patch is included.
+
+A source build of this fork also includes the upstream KytyPS5 fixes merged after int21
+and the `-CommandBufferScale` experiment:
+
+```powershell
+.\Start-AstroBot.ps1 -GamePath 'D:\Games\AstroBot' -SourceExecutable 'D:\Build\kyty_emulator.exe' -CommandBufferScale 2
+```
+
+It sets `KYTY_ASTRO_CB_SCALE`, which multiplies Astro Bot's five draw-thread command
+buffers (7, 7, 4, 4 and 6 MiB) before the game starts; running out of them is the game's
+"too many objects/batches in this scene" crash. The table address is verified only for
+PPSA21567 v01.018.000. For v01.007.000 the emulator scans the game's writable data for
+that exact table and patches it only when it finds a single copy; `startup.txt` then shows
+`command buffer table found by signature at +0x...`. Please report that line and whether
+busy levels still crash. `1` disables the scale; the pinned PGO release rejects the option.
 
 From a source checkout, build just the layer without downloading the upstream
 runtime, using an x64 Visual Studio developer shell with clang-cl, Ninja,
