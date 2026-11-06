@@ -45808,7 +45808,6 @@ TestCase GlobalLoadShortD16Captured(u32 wave_size, bool high = false) {
   }
   AppendEnd(&code);
   test.bda_mappings = {{GuestBase, 4u * passes * wave_size}};
-  if (high) test.fault_free_address = uint64_t{Marker} + 0x70u;
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
