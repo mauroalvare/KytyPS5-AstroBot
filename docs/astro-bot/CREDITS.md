@@ -5,10 +5,13 @@
 - [KytyPS5/KytyPS5](https://github.com/KytyPS5/KytyPS5), based on
   [InoriRus/Kyty](https://github.com/InoriRus/Kyty).
 - [Jetsku/KytyPS5](https://github.com/Jetsku/KytyPS5): U59 renderer, integration and PGO work.
-- Exact source base: `28bc20f146a276479acf42d2e405fb46a4491b8e`, tag
-  `u59-windows-20261013-int19.1`.
-- Original U59 PGO executable SHA-256:
-  `74e34635d3b8b426b20b9c2e0172aee87f76fede0c11001da959f1b8ecabab34`.
+- Exact source base: `744705ee1df4b0acb1af382ff5c32ca4a20aa5f7`, tag
+  `u59-windows-20261024-int21` (the earlier preview used `28bc20f1`, int19.1).
+- Original U59 int21 PGO executable SHA-256:
+  `6ba3fb4617ed15ec2ea235f1b6c4b5d4438d89408e3aa7ead4f598a206a20507`.
+- chenxiao07's fork changes ported by Jetsku into int21, and the upstream KytyPS5
+  contributors whose later commits are cherry-picked here with their original authorship
+  (see [Upstream sync](BUILDING.md#upstream-sync)).
 
 ## Earlier fixes used during investigation
 

@@ -3,13 +3,15 @@
 ## Get the source
 
 ```powershell
-git clone --recurse-submodules --branch astro-bot-experimental https://github.com/mauroalvare/KytyPS5-AstroBot.git
+git clone --recurse-submodules https://github.com/mauroalvare/KytyPS5-AstroBot.git
 cd KytyPS5-AstroBot
 python -m pip install pre-commit
 python -m pre_commit install --install-hooks
 ```
 
-The source branch starts at Jetsku U59 commit `28bc20f146a276479acf42d2e405fb46a4491b8e`.
+The source is Jetsku U59 int21 (`744705ee1df4b0acb1af382ff5c32ca4a20aa5f7` plus its Linux build
+fix `5fef88a86e93c0a383bc583d416ddadb135286fb`), this fork's Astro Bot changes and the
+upstream KytyPS5 commits listed under [Upstream sync](#upstream-sync).
 Its submodules stay pinned. Do not replace them with unrelated latest versions.
 The original license, upstream workflow and formatting configuration are preserved.
 
@@ -36,6 +38,25 @@ built instead of pretending it is the downloaded PGO release.
 A regular Release build does not recreate Jetsku's profile-guided build. Reproducing PGO
 requires the matching compiler, training profile and source-path arrangement described
 by the base. Do not claim identical performance without measuring it.
+
+## Upstream sync
+
+U59 int21 already merges upstream KytyPS5 through `79837b423d` (22 October 2026). Upstream
+`main` was then 291 commits ahead (through `9a29dc62`, 6 November 2026). A full merge
+produces about 1000 conflict hunks in the renderer and shader recompiler, which U59
+rewrote, so this branch instead cherry-picks (`git cherry-pick -x`) every upstream commit
+that applies cleanly, in order, and keeps only those that build and pass the tests:
+
+- 70 commits are included; each keeps its upstream hash in a `cherry picked from` line.
+- Left out on purpose: `ad61e186` (U59 already decodes `S_CLAUSE`), `7cfc07db` (removes
+  page-table helpers U59's texture cache uses), and `f04495ca`/`5a221ae8` (change the IR
+  block layout that U59's program cloning depends on).
+- The other ~217 commits conflict with U59 and need porting one by one. List them with
+  `git cherry -v HEAD <upstream>/main` and look for lines starting with `+`.
+
+Two cherry-picked tests were adapted to U59 behaviour that differs on purpose: FLAT-family
+GLC/SLC bits are decoded as cache hints, and preserved-half destinations are merged with
+And/ShiftLeft/Or instead of `BitFieldInsert`.
 
 ## Presentation tool only
 
