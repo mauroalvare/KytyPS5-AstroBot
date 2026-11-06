@@ -2,6 +2,9 @@
 #define KYTY_LOADER_GAME_PATCH_FILTER_H_
 
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -112,6 +115,60 @@ inline ModSelection SelectMods(const std::vector<ModEntry>&    mods,
 		}
 	}
 	return selection;
+}
+
+// Astro Bot draw-thread command buffer table (KYTY_ASTRO_CB_SCALE): five 32-bit sizes in MiB.
+// ApplyBuiltin patches it at a fixed address in the verified PPSA21567 01.018.000 build; other
+// Astro Bot builds can opt in to a signature scan that must find exactly one copy of the table.
+inline constexpr uint32_t kAstroCbSizes[5] = {7, 7, 4, 4, 6};
+
+// Title IDs of Astro Bot builds this fork has been tested with: PPSA21567 (01.018.000, the table
+// address is verified) and PPSA21564 (01.007.000, the tools/astro-bot kit's pinned game).
+inline bool IsAstroBotTitle(std::string_view title_id) {
+	return title_id == "PPSA21567" || title_id == "PPSA21564";
+}
+
+// Counts the occurrences of `needle` in `data` (overlapping ones too), stopping at `limit`, and
+// stores the offset of the first one in `first`. A table is patched only when the total count over
+// every scanned segment is exactly one.
+inline size_t CountOccurrences(const uint8_t* data, size_t size, const void* needle,
+                               size_t needle_size, size_t limit, size_t* first) {
+	size_t count = 0;
+	if (data == nullptr || needle == nullptr || needle_size == 0 || size < needle_size) {
+		return 0;
+	}
+	const auto* bytes = static_cast<const uint8_t*>(needle);
+	for (size_t offset = 0; offset + needle_size <= size && count < limit; offset++) {
+		if (data[offset] == bytes[0] && std::memcmp(data + offset, bytes, needle_size) == 0) {
+			if (count == 0 && first != nullptr) {
+				*first = offset;
+			}
+			count++;
+		}
+	}
+	return count;
+}
+
+// KYTY_ASTRO_CB_SCALE: an unset value means the default scale (2) for the verified build only; a
+// set value is clamped to 1-4 and also opts other Astro Bot builds in to the signature scan.
+struct AstroCbScale {
+	int  scale    = 2;
+	bool explicit_value = false;
+};
+
+inline AstroCbScale ParseAstroCbScale(const char* value) {
+	AstroCbScale result;
+	if (value == nullptr || *value == '\0') {
+		return result;
+	}
+	char* end    = nullptr;
+	long  parsed = std::strtol(value, &end, 10);
+	if (end == value) {
+		return result;
+	}
+	result.scale          = static_cast<int>(parsed < 1 ? 1 : (parsed > 4 ? 4 : parsed));
+	result.explicit_value = true;
+	return result;
 }
 
 } // namespace Loader::GamePatch
