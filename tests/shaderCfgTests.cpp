@@ -15097,8 +15097,13 @@ void TestFlatLoadShortD16HiCompilesAndValidates() {
   Check(result.decoded_dump.find("FLAT_LOAD_SHORT_D16_HI") != std::string::npos &&
             result.decoded_dump.find("unsupported family=") == std::string::npos,
         "GLOBAL_LOAD_SHORT_D16_HI did not reach the decoded program");
-  Check(result.ir_dump.find("LoadAddressU16") != std::string::npos &&
-            result.ir_dump.find("BitFieldInsert") != std::string::npos,
+  // U59 merges a preserved-half destination with And/ShiftLeft/Or instead of BitFieldInsert
+  // (Translator::WriteRawU32, SDWA DST_U=2). Here v16 starts as a known zero, so the Or with the
+  // cleared low half folds away and the loaded halfword is only shifted into bits [31:16].
+  const bool merged = result.ir_dump.find("BitFieldInsert") != std::string::npos ||
+                      (result.ir_dump.find("ShiftLeftLogical32") != std::string::npos &&
+                       result.ir_dump.find(", 0x00000010 ") != std::string::npos);
+  Check(result.ir_dump.find("LoadAddressU16") != std::string::npos && merged,
         "GLOBAL_LOAD_SHORT_D16_HI did not become a 16-bit load merged into the old register");
   CheckSpirvBinaryValidates(result.spirv);
 }
@@ -15175,17 +15180,20 @@ void TestFlatLoadShortD16HiAddressFields() {
             global_pair.src1.reg == 10,
         "GLOBAL D16 high-half load with SADDR off must use the VGPR pair");
 
-  // DLC is only a cache hint and stays visible; LDS, GLC and SLC on a load and the reserved
-  // segment are not implemented and must keep failing loudly.
+  // U59 decodes GLC, SLC and DLC on FLAT-family accesses as cache hints that stay visible
+  // (see the GLC/SLC/DLC hint test below); LDS and the reserved segment are not implemented
+  // and must keep failing loudly.
   const auto dlc = decode(SegGlobal, 4, 2, DlcBit);
   Check(dlc.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI && dlc.dlc && !dlc.glc && !dlc.slc,
         "GLOBAL D16 high-half load lost its DLC hint");
   Check(decode(SegGlobal, 0, 2, LdsBit).opcode == Decoder::Opcode::UNSUPPORTED,
         "FLAT-family D16 high-half load accepted LDS=1");
-  Check(decode(SegGlobal, 0, 2, GlcBit).opcode == Decoder::Opcode::UNSUPPORTED,
-        "FLAT-family D16 high-half load accepted GLC=1");
-  Check(decode(SegGlobal, 0, 2, SlcBit).opcode == Decoder::Opcode::UNSUPPORTED,
-        "FLAT-family D16 high-half load accepted SLC=1 on a load");
+  const auto glc = decode(SegGlobal, 0, 2, GlcBit);
+  Check(glc.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI && glc.glc && !glc.slc,
+        "GLOBAL D16 high-half load lost its GLC hint");
+  const auto slc = decode(SegGlobal, 0, 2, SlcBit);
+  Check(slc.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI && slc.slc && !slc.glc,
+        "GLOBAL D16 high-half load lost its SLC hint");
   Check(decode(SegReserved, 0, 2).opcode == Decoder::Opcode::UNSUPPORTED,
         "FLAT-family D16 high-half load accepted the reserved segment");
 }
