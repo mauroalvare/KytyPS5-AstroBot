@@ -68,6 +68,11 @@ foreach($mode in @('Stable','1440p','90','120','Ultrawide','DeferredGI')){
 $rumble=& (Join-Path $overlay 'Start-AstroBot.ps1') -Mode Stable -Vibration Compatible -PrepareOnly | ConvertFrom-Json
 Check ($rumble.Emulator.EndsWith('kyty_emulator_rumble.exe') -and $rumble.Environment.KYTY_DUALSENSE_HAPTICS -eq 'rumble') 'Compatible mode selects only the separate guarded runtime copy'
 Throws {& (Join-Path $overlay 'Start-AstroBot.ps1') -Display 'Second monitor' -PrepareOnly} 'source build' 'Pinned PGO does not pretend to support monitor selection'
+Throws {& (Join-Path $overlay 'Start-AstroBot.ps1') -CommandBufferScale 2 -PrepareOnly} 'source build' 'Pinned PGO does not pretend to scale the 01.007 command buffers'
+$sourceBuild=& (Join-Path $overlay 'Start-AstroBot.ps1') -SourceExecutable (Join-Path $overlay 'runtime\kyty_emulator.exe') -Display '2' -CommandBufferScale 2 -Vibration Compatible -PrepareOnly | ConvertFrom-Json
+Check ($sourceBuild.Environment.KYTY_DISPLAY -eq '2' -and $sourceBuild.Environment.KYTY_ASTRO_CB_SCALE -eq '2' -and $sourceBuild.Environment.KYTY_DUALSENSE_HAPTICS -eq 'rumble' -and $sourceBuild.RuntimeKind -like 'User-supplied source build*') 'A source build gets monitor selection, the command buffer opt-in and native rumble fallback'
+$plain=& (Join-Path $overlay 'Start-AstroBot.ps1') -Mode Stable -PrepareOnly | ConvertFrom-Json
+Check ($null -eq $plain.Environment.KYTY_ASTRO_CB_SCALE -and $plain.CommandBufferScale -eq 0) 'The default launch leaves the command buffer scale to the emulator'
 $environmentAfter=Get-ChildItem Env: | Sort-Object Name | Select-Object Name,Value | ConvertTo-Json -Compress
 Check ($environmentBefore -ceq $environmentAfter -and $before -ceq (Snapshot $overlay)) 'Every preparation preserves the complete environment and all existing files'
 $command=ConvertTo-AstroCommandLine @('plain','with space','D:\Tail\','say "hello"')
