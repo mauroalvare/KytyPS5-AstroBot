@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -104,6 +105,8 @@ struct EmitterState {
 	Builder                                          builder;
 	const IR::Program&                               program;
 	ShaderStageInputInfo                             input_info;
+	// PA_CL_UCP planes the last pre-rasterization stage writes as clip distances (upstream feed075a9).
+	uint32_t                                        user_clip_planes = 0;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;
@@ -118,18 +121,34 @@ struct EmitterState {
 	std::array<uint32_t, 3>                          u32_vector_types {};
 	std::array<uint32_t, 3>                          i32_vector_types {};
 	std::array<uint32_t, 3>                          f32_vector_types {};
-	std::array<uint32_t, 6>                          tess_variables {};
+	std::array<uint32_t, IR::NumTessellationAttributes> tess_variables {};
 	uint32_t                                         tess_inner_variable = 0;
-	uint32_t                                         tess_patch_base     = 0;
 
 	const SpirvRequirements                          requirements;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
+	// KYTY_WAVE64_WARPS (split wave): a wave64 compute workgroup of one wave runs as two 32-wide
+	// host subgroups, one guest lane per invocation (lane_count 1). Cross-lane operations
+	// exchange the halves through workgroup memory (ExchangeWaveValue), and DS accesses
+	// synchronize the halves the guest ran in lockstep.
+	bool                                             split_wave              = false;
+	uint32_t                                         wave_exchange_variable  = 0;
+	uint32_t                                         wave_exchange_parity    = 0;
+	// Blocks whose conditional branch each half decides on its own lanes (SplitWaveLocalBranches).
+	std::unordered_set<const IR::Block*>             wave_local_branches;
+	// The probe emission: every branch is half-local, and wave_sync_blocks collects the blocks
+	// that synchronize the halves.
+	bool                                             wave_probe              = false;
+	std::unordered_set<const IR::Block*>*            wave_sync_blocks        = nullptr;
+	// DS instructions write the LDS, so DS reads must wait for the other half too.
+	bool                                             ds_writes_lds           = false;
 	// KYTY_WAVE32_CLUSTERS (Spirv::WaveClustersActive): a wave32 program on a host subgroup that may
 	// hold two guest waves keeps each to its own 32 lanes (EmitSubgroupLocalInvocationId,
 	// EmitHostLane, EmitWaveBallot).
 	bool                                             wave_clusters           = false;
 	uint32_t                                         storage_buffer_variable = 0;
+	// KYTY_UNIFORM_BUFFERS: the constant-only buffers (DescriptorBindingKind::UniformBuffers).
+	uint32_t                                         uniform_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u8_variable = 0;
 	uint32_t                                         storage_buffer_u16_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
@@ -389,6 +408,7 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
                           uint32_t mip = 0, uint32_t array_index = 0);
 
+// sample is 0 (no id) for single-sampled images.
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel);
 
@@ -464,6 +484,34 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
 
+// Split waves (EmitterState::split_wave). Whether lane operations confined to 32-lane halves use
+// the host subgroup's lane (lane & 31): two lanes per invocation or a split wave.
+[[nodiscard]] inline bool HalfWaveHost(const EmitterState& state) {
+	return state.lane_count == 2 || state.split_wave;
+}
+// The invocation's lane in its host subgroup (0-31 for a split wave).
+uint32_t EmitHostSubgroupLane(EmitterState& state);
+// Records that the block being emitted synchronizes a split wave's halves.
+void     NoteWaveSync(EmitterState& state);
+// Synchronizes a split wave's halves and makes their workgroup memory writes visible.
+void     EmitWaveBarrier(EmitterState& state);
+// The value (u32) of guest lane `lane` (0-63) of a split wave, through workgroup memory.
+uint32_t ExchangeWaveValue(EmitterState& state, uint32_t value, uint32_t lane);
+// The 64-lane ballot of `predicate` in a split wave, as {low lanes, high lanes, 0, 0}.
+uint32_t ExchangeWaveBallot(EmitterState& state, uint32_t predicate);
+// The ballot word of `predicate` over the invocation's own host subgroup.
+uint32_t EmitHostBallotWord(EmitterState& state, uint32_t predicate);
+// The invocation's host-subgroup ballot placed as a wave ballot whose lane bits are right for
+// lanes of the invocation's own half: {word, word, 0, 0}.
+uint32_t EmitHalfBallot(EmitterState& state, uint32_t predicate);
+// Reads `value` (any 32-bit or bool type) from guest lane `lane` of the invocation's own half.
+uint32_t ReadHostSubgroupLane(EmitterState& state, uint32_t type, uint32_t value, uint32_t lane);
+// The blocks whose conditional branch a split wave's halves may decide on their own: no block
+// the branch controls synchronizes the halves (sync_blocks), directly or through another branch
+// that stays whole-wave, and no such block ends the program.
+std::unordered_set<const IR::Block*> SplitWaveLocalBranches(
+    const IR::Program& program, const std::unordered_set<const IR::Block*>& sync_blocks);
+
 inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32_t, uint32_t>;
 
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);
@@ -490,6 +538,7 @@ inline spv::MemorySemanticsMask LdsMemorySemantics(const EmitterState& state) {
 struct MemoryResourceAccess {
 	IR::ResourceKind      kind             = IR::ResourceKind::None;
 	uint32_t              object_pointer   = 0;
+	uint32_t              descriptor_index = 0;
 	uint32_t              length           = 0;
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
@@ -651,6 +700,10 @@ auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
 
 template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
+	if (condition == ConstantBool(state, true)) {
+		fn();
+		return;
+	}
 	const auto then_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
@@ -664,6 +717,7 @@ void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
                                        uint32_t default_value, Fn&& fn) {
+	if (condition == ConstantBool(state, true)) return fn();
 	const auto then_label  = state.builder.AllocateId();
 	const auto header     = state.current_label;
 	const auto merge_label = state.builder.AllocateId();

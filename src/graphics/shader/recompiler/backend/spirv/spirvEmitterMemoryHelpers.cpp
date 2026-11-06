@@ -112,19 +112,37 @@ uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryIn
 }
 
 void EmitMemoryOffsets(EmitterState& state) {
-	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
+	const auto count = state.program.bindings.memory_offset_count;
+	// One shader-data load per packed word of four byte offsets.
+	for (uint32_t i = 0; i < count; i += 4u) {
 		const auto word =
 		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
-		const auto shift             = ConstantU32(state, (i % 4u) * 8u);
-		state.memory_byte_offsets[i] = EmitBinaryU32(
-		    state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, word, shift),
-		    ConstantU32(state, 0xffu));
+		for (uint32_t lane = 0; lane < std::min(4u, count - i); ++lane) {
+			state.memory_byte_offsets[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
+		}
 	}
 }
 
+// Stages without a workgroup emulate LDS with one private array per invocation. A GPU keeps
+// hundreds of thousands of invocations in flight, so this size multiplies into driver local memory:
+// a fixed 8192 dwords (32 KB) asked for gigabytes and killed the device (a write fault in the
+// first heavy pixel shader that touched LDS). A pixel shader can only address the LDS that
+// EXTRA_LDS_SIZE reserves, a vertex shader the LDS_SIZE of its GS stage; hardware reads zero and
+// drops writes beyond it, as the bounds checks do.
+constexpr uint32_t FUNCTION_LDS_DWORDS = 1024u;
+
 uint32_t LdsDwordCount(const EmitterState& state) {
-	const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info);
-	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
+	if (const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
+		return workgroup->lds_size_dwords;
+	}
+	if (state.program.stage == ShaderType::Pixel && state.input_info.pixel != nullptr) {
+		return std::max(state.input_info.pixel->lds_size_dwords, 1u);
+	}
+	if (state.program.stage == ShaderType::Vertex && state.input_info.vertex != nullptr) {
+		return std::max(state.input_info.vertex->lds_size_dwords, 1u);
+	}
+	return FUNCTION_LDS_DWORDS;
 }
 
 void EnsureLdsStorage(EmitterState& state) {
@@ -174,7 +192,7 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
 	                          ConstantU32(state, array_index));
-	access.byte_offset = state.memory_byte_offsets[array_index];
+	access.byte_offset = state.memory_byte_offsets[mem.resource];
 	access.length      = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
 	                          access.object_pointer, 0);

@@ -2,8 +2,10 @@
 #include "common/ramStats.h"
 
 #include "common/hangWatchdog.h"
+#include "common/spinGate.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cinttypes>
 #include <new>
@@ -223,6 +225,7 @@ const char* OpName(Op op) noexcept {
 	    "DrawIndexedIndirectCount",
 	    "Dispatch",
 	    "DispatchIndirect",
+	    "DispatchBase",
 	    "ResetQueryPool",
 	    "BeginQuery",
 	    "EndQuery",
@@ -230,6 +233,9 @@ const char* OpName(Op op) noexcept {
 	    "WriteTimestamp2",
 	    "UpdateDescriptorSets",
 	    "WriteBufferMarker",
+	    "ClearColorImage",
+	    "ClearDepthStencilImage",
+	    "HostCopy",
 	};
 	static_assert(std::size(names) == static_cast<size_t>(Op::Count));
 	const auto index = static_cast<size_t>(op);
@@ -620,6 +626,34 @@ uint64_t ColorWriteEnable(uint32_t count, const vk::Bool32* enables) {
 	return h.Value();
 }
 
+uint64_t ClearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue& color,
+                         uint32_t count, const vk::ImageSubresourceRange* ranges) {
+	Hasher h(Op::ClearColorImage);
+	h.AddHandle(image);
+	h.AddEnum(layout);
+	h.AddBytes(&color, sizeof(color));
+	h.Add(count);
+	for (uint32_t i = 0; i < count; i++) {
+		AddRange(h, ranges[i]);
+	}
+	return h.Value();
+}
+
+uint64_t ClearDepthStencilImage(vk::Image image, vk::ImageLayout layout,
+                                const vk::ClearDepthStencilValue& value, uint32_t count,
+                                const vk::ImageSubresourceRange* ranges) {
+	Hasher h(Op::ClearDepthStencilImage);
+	h.AddHandle(image);
+	h.AddEnum(layout);
+	h.AddFloat(value.depth);
+	h.Add(value.stencil);
+	h.Add(count);
+	for (uint32_t i = 0; i < count; i++) {
+		AddRange(h, ranges[i]);
+	}
+	return h.Value();
+}
+
 } // namespace VerifyHash
 
 // ------------------------------------------------------------------------------------------------
@@ -754,8 +788,9 @@ bool Ring::WaitPublished(const std::atomic<bool>& stop, const WaitPolicy& policy
 	                         m_published_cache);
 	const auto start = NowNs();
 	stats.spins++;
-	const bool spun =
-	    Spin(policy.spin_ns, [&] { return available() || stop.load(std::memory_order_acquire); });
+	// KYTY_SPIN_GATE: the consumer's idle spin only while the PC keeps CPUs idle.
+	const bool spun = Spin(Common::SpinGate::SpinAllowed() ? policy.spin_ns : 0,
+	                       [&] { return available() || stop.load(std::memory_order_acquire); });
 	if (!spun) {
 		stats.blocks++;
 		for (;;) {
@@ -1301,6 +1336,15 @@ void Encoder::dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) {
 	                          : 0);
 }
 
+void Encoder::dispatchBase(uint32_t base_x, uint32_t base_y, uint32_t base_z, uint32_t x,
+                           uint32_t y, uint32_t z) {
+	auto w = Open(Op::DispatchBase, Sz<DispatchBasePacket>(), false);
+	w.Put(DispatchBasePacket {base_x, base_y, base_z, x, y, z});
+	Close(w, m_options.verify
+	             ? VerifyHash::Value(Op::DispatchBase, base_x, base_y, base_z, x, y, z)
+	             : 0);
+}
+
 void Encoder::resetQueryPool(vk::QueryPool pool, uint32_t first, uint32_t count) {
 	auto w = Open(Op::ResetQueryPool, Sz<QueryRangePacket>(), false);
 	w.Put(QueryRangePacket {pool, first, count});
@@ -1346,6 +1390,13 @@ void Encoder::writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool,
 	             : 0);
 }
 
+void Encoder::hostCopy(void* destination, uint64_t source, uint64_t size) {
+	const auto destination_bits = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(destination));
+	auto       w                = Open(Op::HostCopy, Sz<HostCopyPacket>(), false);
+	w.Put(HostCopyPacket {destination_bits, source, size});
+	Close(w, m_options.verify ? VerifyHash::Value(Op::HostCopy, destination_bits, source, size) : 0);
+}
+
 void Encoder::writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer buffer,
                                    vk::DeviceSize offset, uint32_t marker) {
 	const auto stage_bits = static_cast<uint32_t>(static_cast<VkPipelineStageFlagBits>(stage));
@@ -1353,6 +1404,37 @@ void Encoder::writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer b
 	w.Put(WriteBufferMarkerPacket {buffer, offset, stage_bits, marker});
 	Close(w, m_options.verify
 	             ? VerifyHash::Value(Op::WriteBufferMarker, HandleBits(buffer), offset, stage_bits, marker)
+	             : 0);
+}
+
+void Encoder::clearColorImage(vk::Image image, vk::ImageLayout layout,
+                              const vk::ClearColorValue* color, uint32_t count,
+                              const vk::ImageSubresourceRange* ranges) {
+	EXIT_IF(color == nullptr);
+	auto w = Open(Op::ClearColorImage,
+	              Sz<ClearImagePacket>() + Arr<vk::ImageSubresourceRange>(count), false);
+	ClearImagePacket p {image, layout, count};
+	static_assert(sizeof(p.value) == sizeof(vk::ClearColorValue));
+	std::memcpy(p.value, color, sizeof(p.value));
+	w.Put(p);
+	w.PutArray(ranges, count);
+	Close(w, m_options.verify ? VerifyHash::ClearColorImage(image, layout, *color, count, ranges)
+	                          : 0);
+}
+
+void Encoder::clearDepthStencilImage(vk::Image image, vk::ImageLayout layout,
+                                     const vk::ClearDepthStencilValue* value, uint32_t count,
+                                     const vk::ImageSubresourceRange* ranges) {
+	EXIT_IF(value == nullptr);
+	auto w = Open(Op::ClearDepthStencilImage,
+	              Sz<ClearImagePacket>() + Arr<vk::ImageSubresourceRange>(count), false);
+	ClearImagePacket p {image, layout, count};
+	p.value[0] = std::bit_cast<uint32_t>(value->depth);
+	p.value[1] = value->stencil;
+	w.Put(p);
+	w.PutArray(ranges, count);
+	Close(w, m_options.verify
+	             ? VerifyHash::ClearDepthStencilImage(image, layout, *value, count, ranges)
 	             : 0);
 }
 

@@ -194,7 +194,10 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	auto result = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
 	if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
 		// VRAM ran short (cards with less memory): the pool holds only buffers whose GPU work has
-		// completed, so free all of them and retry once before giving up.
+		// completed, so free all of them and retry once before giving up. That holds because a
+		// buffer enters the pool only from ReleaseScratch, which runs once the tick of its last use
+		// completed (DeferRelease; callers that use a buffer across a possible submission hold a
+		// ScratchHold, so its release is stamped after that use). Held buffers are not in the pool.
 		std::vector<Scratch> idle;
 		{
 			std::scoped_lock lock(m_scratch_mutex);
@@ -255,6 +258,39 @@ void TileManager::TrimScratchPool() {
 }
 
 void TileManager::DeferDestroy(Scratch scratch) {
+	{
+		std::scoped_lock lock(m_hold_mutex);
+		if (m_hold_depth != 0) {
+			// A ScratchHold is open: its caller may still use the buffer in a later tick.
+			m_held.push_back(scratch);
+			return;
+		}
+	}
+	DeferRelease(scratch);
+}
+
+void TileManager::BeginScratchHold() {
+	std::scoped_lock lock(m_hold_mutex);
+	m_hold_depth++;
+}
+
+void TileManager::EndScratchHold() {
+	std::vector<Scratch> held;
+	{
+		std::scoped_lock lock(m_hold_mutex);
+		EXIT_IF(m_hold_depth == 0);
+		if (--m_hold_depth != 0) {
+			return;
+		}
+		held.swap(m_held);
+	}
+	// Every command using these buffers was recorded in this tick or an earlier one.
+	for (const auto& scratch: held) {
+		DeferRelease(scratch);
+	}
+}
+
+void TileManager::DeferRelease(Scratch scratch) {
 	if (m_scratch_pool_limit != 0) {
 		// Runs once the scheduler tick that uses the buffer has completed.
 		m_scheduler.DeferOperation([this, scratch] { ReleaseScratch(scratch); });
@@ -493,7 +529,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	                     target_capacity % 4 != 0);
 
 	m_scheduler.EndRendering();
-	auto                    command = m_scheduler.Current().Handle();
+	const auto              command = m_scheduler.Current().HelperSink();
 	vk::BufferMemoryBarrier barriers[3] {};
 	barriers[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
 	barriers[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
@@ -987,7 +1023,7 @@ void TileManager::RecordImage(Image& image, bool load, vk::Buffer tiled, uint64_
 	}
 
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Handle();
+	const auto command = m_scheduler.Current().HelperSink();
 	// Before: the tiled bytes (possibly host-written staging) and the parameters are visible
 	// to the dispatches; the image is in GENERAL for storage access, ordered after every
 	// earlier access (Image::GetBarriers).
@@ -1068,7 +1104,7 @@ void TileManager::RecordImage(Image& image, bool load, vk::Buffer tiled, uint64_
 	image.NoteContentWrite();
 	image.Transit(vk::ImageLayout::eGeneral,
 	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {},
-	              command);
+	              command.Identity());
 }
 
 bool TileManager::DetileToImage(Image& image, vk::Buffer tiled, uint64_t tiled_offset,
@@ -1289,7 +1325,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	EXIT_IF(source.size < source_barrier_size || target.size < target_barrier_size);
 
 	m_scheduler.EndRendering();
-	auto                    command = m_scheduler.Current().Handle();
+	const auto              command = m_scheduler.Current().HelperSink();
 	vk::BufferMemoryBarrier barriers[2] {};
 	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1435,7 +1471,7 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eMemoryRead;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderWrite;
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Handle();
+	const auto command = m_scheduler.Current().HelperSink();
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);

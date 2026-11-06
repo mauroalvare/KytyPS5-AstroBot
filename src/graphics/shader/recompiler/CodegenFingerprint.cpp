@@ -20,12 +20,12 @@ constexpr const char* kSwitches[] = {KYTY_CODEGEN_SWITCH_LIST nullptr};
 constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
-// Members: 36 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
+// Members: 38 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
 // loop_guard_budget, loop_guard_shaders, dispatcher_cap, rt_node_budget, rt_function,
 // lds_limit_override.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
-static_assert(sizeof(CodegenOptions) == 104,"CodegenOptions changed: update CodegenFingerprint");
+static_assert(sizeof(CodegenOptions) == 112,"CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
@@ -113,6 +113,35 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U32(options.lds_limit_override);
 	b.U8(options.ps_per_vertex ? 1u : 0u);
 	b.U8(options.clip_guard ? 1u : 0u);
+	// Switches added since: only when on, so caches made with them off stay valid.
+	if (options.branchless_loads) {
+		b.Text("branchless_loads");
+	}
+	if (options.branchless_lds) {
+		b.Text("branchless_lds");
+	}
+	if (options.cfg_clone_exits) {
+		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms
+	}
+	if (options.wave64_warps) {
+		b.Text("wave64_warps");
+	}
+	if (options.native_float_min_max) {
+		b.Text("native_float_min_max");
+	}
+	if (options.dcache_invalidate) {
+		b.Text("dcache_invalidate");
+	}
+	if (options.readfirstlane_exec_zero) {
+		b.Text("readfirstlane_exec_zero");
+	}
+	if (options.uniform_buffers && GetHostUniformBufferRobust()) {
+		b.Text("uniform_buffers");
+	}
+	if (options.lane_local) {
+		b.Text("lane_local");
+		b.U8(GetHostComputeSubgroups32() ? 1u : 0u);
+	}
 
 	// Host device state the emitter reads (set once by the device layer).
 	const auto float_controls = Spirv::GetHostFloatControls();

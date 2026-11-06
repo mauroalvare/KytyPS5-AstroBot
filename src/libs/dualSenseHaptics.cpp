@@ -387,10 +387,14 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 	if (frames == 0) {
 		return 0;
 	}
-
 	if (!stream->speaker && (ForceRumbleEnvelope() ||
 	                         SDL_GetGamepadTypeForID(static_cast<SDL_JoystickID>(controller)) !=
 	                             SDL_GAMEPAD_TYPE_PS5)) {
+		// Non-DualSense pads have no haptic audio path, and KYTY_DUALSENSE_HAPTICS=rumble opts a
+		// DualSense whose USB endpoint accepts PCM without moving the actuators (seen in Astro Bot)
+		// into the same fallback: approximate the haptic signal with the rumble motors.
+		CloseDevice(stream);
+		stream->next_check = 0;
 		if (ForceRumbleEnvelope()) {
 			stream->controller = controller;
 			ReportRoute(stream, Route::Rumble, nullptr);
@@ -402,8 +406,7 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 				const auto index  = (static_cast<size_t>(first_frame) + frame) * channels + src_ch;
 				float      value  = is_float ? static_cast<const float*>(data)[index]
 				                             : static_cast<const int16_t*>(data)[index] / 32768.0f;
-				value *=
-				    volume[src_ch] / 32768.0f * gain * (gains != nullptr ? gains[src_ch] : 1.0f);
+				value *= volume[src_ch] / 32768.0f * gain * (gains != nullptr ? gains[src_ch] : 1.0f);
 				peak[ch] = std::max(peak[ch], std::fabs(value));
 			}
 		}
@@ -413,7 +416,7 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 		SDL_LockJoysticks();
 		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller));
 		    pad != nullptr) {
-			(void)SDL_RumbleGamepad(pad, to_motor(peak[0]), to_motor(peak[1]), 100);
+			(void) SDL_RumbleGamepad(pad, to_motor(peak[0]), to_motor(peak[1]), 100);
 		}
 		SDL_UnlockJoysticks();
 		return static_cast<uint64_t>(frames) * 1000000 / stream->freq;

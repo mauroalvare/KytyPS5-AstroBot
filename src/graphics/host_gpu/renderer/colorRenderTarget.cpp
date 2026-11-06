@@ -45,6 +45,14 @@ bool CmaskFastClearEnabled() {
 	return enabled;
 }
 
+bool CmaskMsaaEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CMASK_MSAA");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 bool DrawSequenceEnabled(DrawSequencePart part) {
 	static std::atomic<int64_t> parts_once {Common::OnceUnset};
 	const auto parts = static_cast<uint32_t>(Common::Once(parts_once, [] {
@@ -269,14 +277,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
 	auto        mask    = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
-	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
+	if (ignore_target_mask && render_target_bound(rt) && mask == 0) {
 		mask = 0x0f;
 	}
 
 	// KYTY_RENDER_STATE_FAST reset: both paths below that resolve a target assign every field of
 	// the entry (desc, image_id, target_slot, guest_mip_level, guest_array_layer, export_mapping;
 	// SameRenderColorInfo names them all), so only an entry without a target is value-initialised.
-	const bool output = rt.base.addr != 0 && mask != 0;
+	const bool output = render_target_bound(rt) && mask != 0;
 	if (!output || !RenderStateFastEnabled(RenderStatePart::Reset)) {
 		r = {};
 	}
@@ -322,7 +330,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		CommitStats::AddItems(CommitStats::Item::ColorMemoMiss, 1);
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
-	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
+	// TODO(PPSA24156): Replace this 2x MSAA approximation with proper 4-coverage/2-fragment EQAA.
+	const bool approximate_eqaa = rt.attrib.num_samples == 2 && rt.attrib.num_fragments == 1;
+	if (approximate_eqaa) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(
+			    "Warning: approximating 4-coverage/2-fragment EQAA with 2x MSAA.\n");
+		}
+	}
+	if (samples == 0 || (rt.attrib.num_samples != rt.attrib.num_fragments && !approximate_eqaa)) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
 	}
@@ -563,7 +580,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	// The host image holds expanded texels, so the texture cache applies a pending clear when the
 	// target is bound (TextureCache::MaterializeCmaskClear). Single-sample, single-mip 2D targets.
 	if (!has_dcc && CmaskFastClearEnabled() && rt.info.cmask_fast_clear_enable &&
-	    rt.cmask.addr != 0 && tile && !texture_tile && !volume && samples == 1 && levels == 1) {
+	    rt.cmask.addr != 0 && tile && !texture_tile && !volume &&
+	    (samples == 1 || CmaskMsaaEnabled()) && levels == 1) {
 		TileSizeAlign cmask_size {};
 		if (TileGetCmaskSize(width, height, view.image_layers, cmask_size)) {
 			desc.cmask.range       = {rt.cmask.addr, cmask_size.size};

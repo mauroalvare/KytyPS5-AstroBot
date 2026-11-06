@@ -83,6 +83,11 @@ bool PlanRanges(const CompiledShaderInfo& program, const ResourceSnapshot& resou
 		if (LibKernel::Memory::ClampRangeSizeQuiet(address, requested_size) != requested_size) {
 			return false;
 		}
+		// KYTY_BUFFER_RANGE_FIXES' zero-stride payload rule: left to the serial path.
+		if (BufferRangeFixesEnabled() && descriptor.Stride() == 0 && descriptor.OutOfBounds() == 2 &&
+		    !program.info.buffers[i].scalar && program.info.buffers[i].max_byte_extent > requested_size) {
+			return false;
+		}
 		range.address = address;
 		range.size    = requested_size;
 	}
@@ -246,8 +251,14 @@ bool PredictTargets(const GraphicContext& graphics, const HW::Context& ctx,
 			continue;
 		}
 		const auto& rt = ctx.GetRenderTarget(slot);
-		if (rt.base.addr == 0 || render_target_mask_slot(ctx.GetRenderTargetMask(), slot) == 0) {
+		if (!render_target_bound(rt) || render_target_mask_slot(ctx.GetRenderTargetMask(), slot) == 0) {
 			continue; // no target in this slot
+		}
+		// KYTY_MRT_SPLIT (renderDraw.cpp): a surface bound to two slots splits the draw; no plan.
+		for (uint32_t index = 0; index < targets.color_count; index++) {
+			if (ctx.GetRenderTarget(targets.colors[index].slot).base.addr == rt.base.addr) {
+				return false;
+			}
 		}
 		const auto samples = render_sample_count(rt.attrib.num_fragments);
 		if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {

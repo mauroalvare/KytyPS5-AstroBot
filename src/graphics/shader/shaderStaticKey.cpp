@@ -26,6 +26,15 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
 	key.push_back(static_cast<uint32_t>(info.start_instance_sgpr));
+	// Per-invocation LDS size (upstream fa8216c4d); only keys with LDS get the word.
+	if (info.lds_size_dwords != 0) {
+		key.push_back(0x1d500000u | info.lds_size_dwords);
+	}
+	// PA_CL_UCP planes (upstream feed075a9); only keys with planes get the word, so other keys and
+	// shipped pipeline lists stay as before.
+	if (info.user_clip_planes != 0) {
+		key.push_back(0x55c90000u | info.user_clip_planes);
+	}
 	// Relocated PS parameters (ShaderLinkVertexPixelParameters). Only keys with aliases get these
 	// words, so the keys of every other vertex shader (and the shipped pipeline lists) stay as before;
 	// the tag cannot be mistaken for the clip-space flag that follows otherwise.
@@ -85,6 +94,10 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(info.input_num);
 	key.push_back(info.wave_size);
 	key.push_back(info.ps_system_input_base);
+	// EXTRA_LDS_SIZE (upstream fa8216c4d); only keys with LDS get the word.
+	if (info.lds_size_dwords != 0) {
+		key.push_back(0x1d500000u | info.lds_size_dwords);
+	}
 	key.push_back(info.custom_interpolation_mask);
 	key.push_back(info.ps_perspective_center_vgpr);
 	key.push_back(info.ps_perspective_centroid_vgpr);
@@ -96,9 +109,13 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_pos_y));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_z));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_w));
-	key.push_back(static_cast<uint32_t>(info.ps_front_face));
+	// Bit 1: FRONT_FACE_ALL_BITS (0, float +/-1, keeps older keys).
+	key.push_back(static_cast<uint32_t>(info.ps_front_face) |
+	              (static_cast<uint32_t>(info.ps_front_face_all_bits) << 1u));
 	key.push_back(static_cast<uint32_t>(info.ps_ancillary));
-	key.push_back(static_cast<uint32_t>(info.ps_no_perspective));
+	// Bits 8+: the provoking-vertex mode of flat parameters (0, first vertex, keeps older keys).
+	key.push_back(static_cast<uint32_t>(info.ps_no_perspective) |
+	              (static_cast<uint32_t>(info.parameter_mode) << 8u));
 	key.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
@@ -132,7 +149,9 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	// Bit 31: LDS in the device buffer (KYTY_LDS_DEVICE_BUFFER); sizes stay below 2^16 dwords.
 	key.push_back(info.lds_size_dwords | (info.lds_storage ? 0x80000000u : 0u));
 	key.push_back(info.scratch_size_dwords);
-	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions));
+	// Bit 1: an async compute queue (S_GETREG_B32 HW_ID2 answers only for graphics compute).
+	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
+	              (static_cast<uint32_t>(info.async_compute) << 1u));
 	for (int i = 0; i < 3; i++) {
 		key.push_back(info.threads_num[i]);
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));

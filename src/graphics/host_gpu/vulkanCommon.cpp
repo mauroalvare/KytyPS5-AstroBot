@@ -4,7 +4,9 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/spirvLocalArrays.h"
 #include "graphics/host_gpu/vramStats.h"
 
@@ -137,6 +139,10 @@ void RequireVulkanSuccess(vk::Result result, const char* operation) {
 		if (result == vk::Result::eErrorDeviceLost) {
 			// Another thread may see the loss first (the upload DMA worker, a side readback).
 			GpuBreadcrumbs::Dump();
+			Aftermath::WaitForDump(); // KYTY_AFTERMATH: until the driver handed over the crash dump
+			// The thread reporting the loss (DumpDeviceLossDiagnostics) finishes its report and
+			// the device-fault dump file before this exit ends the process.
+			WaitForDeviceLossDiagnostics();
 		}
 		EXIT("%s failed: %s (%d)\n", operation, vk::to_string(result).c_str(),
 		     static_cast<int>(result));

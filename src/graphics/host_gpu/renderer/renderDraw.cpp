@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
 
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -821,7 +822,7 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& sh_regs) {
 	const auto& db = sh_regs.db_shader_control;
 	return db.shader_kill_enable || db.shader_z_export_enable || db.shader_mask_export_enable ||
-	       db.shader_dual_export_enable || db.shader_execute_on_noop;
+	       db.shader_dual_export_enable || db.shader_execute_on_noop || sh_regs.AlphaToMask();
 }
 
 // One per RenderExecutor, reused by every draw instead of being value-initialised (tens of KB)
@@ -951,7 +952,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
-		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
+		depth.load_clear_aspects = {};
+		if (depth.depth_clear_enable || meta_clear)
+			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
+		// Apply pending clears to compressed stencil as well as depth (upstream 5bf37f52a).
+		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
+			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
 		if (meta_clear &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
@@ -1082,9 +1088,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
 		attachment.clear_value[1] = depth.stencil_clear_value;
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
-		attachment.depth_clear    = depth.depth_load_clear_enable;
+		attachment.depth_clear =
+		    static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth);
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
-		attachment.stencil_clear  = depth.stencil_clear_enable;
+		attachment.stencil_clear =
+		    static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eStencil);
 	}
 	depth_scope.Stop();
 	if (color_count == 0 && !depth.image_id) {
@@ -1188,7 +1196,7 @@ bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
 	const auto target_mask = hw.GetRenderTargetMask();
 	for (uint32_t slot = 0; slot < 8; slot++) {
 		const auto& rt = hw.GetRenderTarget(slot);
-		if (rt.base.addr == 0 || (slot != 0 && render_target_mask_slot(target_mask, slot) == 0)) {
+		if (!render_target_bound(rt) || (slot != 0 && render_target_mask_slot(target_mask, slot) == 0)) {
 			continue;
 		}
 		const bool dcc = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
@@ -1200,7 +1208,9 @@ bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
 		// single sample.
 		const bool eligible = materialize && (dcc || cmask) &&
 		                      rt.attrib3.tile_mode == Prospero::TileMode::kRenderTarget &&
-		                      rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0;
+		                      ((rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0) ||
+		                       (cmask && !dcc && CmaskMsaaEnabled() &&
+		                        rt.attrib.num_samples == rt.attrib.num_fragments));
 		uint64_t image_size = 0;
 		if (eligible) {
 			RenderColorInfo target {};
@@ -1269,7 +1279,8 @@ struct PreparedIndirectBuffers {
 // counts are nonzero, so indirect draws in these modes keep the CPU-read arguments.
 static bool MayRunTargetOperation(const HW::Context& hw) {
 	const auto mode = hw.GetColorControl().mode;
-	if (IsMetadataColorMode(mode) || mode == static_cast<uint8_t>(CbColorMode::Resolve)) {
+	if (IsMetadataColorMode(mode) || mode == static_cast<uint8_t>(CbColorMode::Resolve) ||
+	    hw.GetRenderControl().copy_depth_to_color) { // RenderExecutor::CopyDepthToColor
 		return true;
 	}
 	const auto& override = hw.GetDepthRenderOverride();
@@ -1983,7 +1994,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 		const auto output_filter = DrawColorOutputFilter(ctx);
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 			const auto& rt = ctx.GetRenderTarget(slot);
-			if (rt.base.addr != 0 && render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
+			if (render_target_bound(rt) && render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
 			    (output_filter & (1u << slot)) != 0) {
 				target_export_mapping[slot] =
 				    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
@@ -2052,14 +2063,23 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	CommitStats::Mark(CommitStats::Phase::Programs);
 	// A stage whose shader the recompiler skipped (an unresolvable runtime descriptor,
-	// KYTY_SRT_VARIANT_READS) leaves its program empty: drop the draw.
-	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
+	// KYTY_SRT_VARIANT_READS) leaves its program empty: drop the draw. A tessellated draw needs
+	// all three vertex stages (one without a runtime made PrepareBindings exit: Wolverine
+	// HS 0x3ff475220c3b4e7b + TES 0xb39fc591165dbc5f).
+	const bool tess_missing =
+	    state.vertex_stages_written == 3u &&
+	    (!state.programs.vertex[1] || !state.programs.vertex[2] || !state.vertex_info[0].stage ||
+	     !state.vertex_info[1].stage || !state.vertex_info[2].stage);
+	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel) || tess_missing) {
 		// Counted and reported (the first few, then every 2048th) so a dropped draw is never silent.
 		static std::atomic_uint64_t dropped {0};
 		const auto                  count = dropped.fetch_add(1, std::memory_order_relaxed) + 1u;
 		if (count <= 4u || (count & 2047u) == 0u) {
 			std::printf("Warning: draw #%" PRIu64 " dropped, %s program missing (%s)\n", count,
-			            !state.programs.vertex[0] ? "vertex" : "pixel", draw.Name());
+			            !state.programs.vertex[0] ? "vertex"
+			            : tess_missing           ? "tessellation"
+			                                     : "pixel",
+			            draw.Name());
 		}
 		return false;
 	}
@@ -2085,7 +2105,49 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		m_run_verify = true;
 	}
 	KYTY_PROFILER_DETAIL_BLOCK("Draw::ResolveTargets");
-	DrawRunTargets(buffer, draw, render_target_slice_offset, state);
+	// KYTY_DRAW_RUN_TARGETS (drawRun.h): the record's targets, when their inputs are the record's.
+	const auto targets_mode = DrawRun::TargetsKeepMode();
+	const bool keep_targets = targets_mode != 0 && !m_run_verify &&
+	                          DrawRunTargetsCandidate(buffer, state, render_target_slice_offset);
+	if (keep_targets) {
+		OwnedCounters::Add(DrawRun::GetTotals().targets_kept, 1);
+	}
+	if (keep_targets && targets_mode == 1) {
+		const CommitStats::SubScope color_scope(CommitStats::Sub::ColorTargets);
+		state.color_count         = m_run.color_count;
+		state.color_slots_written = m_run.color_slots;
+		// As the resolution does: only a resolved target is marked (a draw without a depth target,
+		// or a colour entry without an image, has an invalid id).
+		for (uint32_t i = 0; i < m_run.color_count; i++) {
+			state.color_info[i] = m_run.colors[i];
+			if (state.color_info[i].image_id) {
+				BindRenderTarget(state.color_info[i].image_id);
+			}
+		}
+		state.depth_info = m_run.depth[0];
+		if (state.depth_info.image_id) {
+			BindRenderTarget(state.depth_info.image_id);
+		}
+		m_run_targets_kept = true;
+	} else {
+		DrawRunTargets(buffer, draw, render_target_slice_offset, state);
+		if (keep_targets) {
+			// Verify: the resolution must have given the record's targets.
+			DrawRun::CountVerifyCheck();
+			bool same = state.color_count == m_run.color_count &&
+			            state.color_slots_written == m_run.color_slots &&
+			            SameRenderDepthInfo(state.depth_info, m_run.depth[0]);
+			for (uint32_t i = 0; same && i < state.color_count; i++) {
+				same = SameRenderColorInfo(state.color_info[i], m_run.colors[i]);
+			}
+			if (!same) {
+				DrawRun::ReportMismatch("kept targets");
+				if (targets_mode == 3) {
+					EXIT("DrawRunVerify: kept targets differ from the resolved ones\n");
+				}
+			}
+		}
+	}
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
@@ -2098,6 +2160,52 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	return true;
 }
 
+// KYTY_MRT_SPLIT (default on; YOTEI 44ea334d4): slots of mask that write the same surface as a
+// lower slot of it, each with channels of its own. Astro Bot's foliage-interaction stamps write RG
+// (blended) through MRT0 and BA through MRT1 of one 1024x1024 surface; one image bound as two
+// Vulkan colour attachments is undefined, and NVIDIA lost the stamps (grass ignored the hover laser
+// or bent ahead of Astro). Such a draw (DrawIndex, DrawAuto) runs twice: once without these slots,
+// once with only them, each pass keeping its slots' masks and blends. KYTY_MRT_SPLIT=0 binds them
+// together as before.
+static Live::Switch g_mrt_split("KYTY_MRT_SPLIT", Live::ParseDefaultOn); // live
+
+static bool MrtSplitEnabled() {
+	return g_mrt_split.Get() != 0;
+}
+
+static uint32_t AliasedColorSlots(const HW::Context& ctx, uint32_t mask) {
+	uint32_t aliased = 0;
+	for (uint32_t later = 1; later < RENDER_COLOR_ATTACHMENTS_MAX; later++) {
+		if ((mask & (1u << later)) == 0) {
+			continue;
+		}
+		const auto later_addr = ctx.GetRenderTarget(later).base.addr;
+		const auto later_mask = render_target_mask_slot(ctx.GetRenderTargetMask(), later);
+		if (later_addr == 0 || later_mask == 0) {
+			continue;
+		}
+		for (uint32_t first = 0; first < later; first++) {
+			if ((mask & (1u << first)) != 0 && (aliased & (1u << first)) == 0 &&
+			    ctx.GetRenderTarget(first).base.addr == later_addr &&
+			    (render_target_mask_slot(ctx.GetRenderTargetMask(), first) & later_mask) == 0) {
+				aliased |= 1u << later;
+				break;
+			}
+		}
+	}
+	return aliased;
+}
+
+// KYTY_MRT_SPLIT accounting: the first splits are logged, then a count every 4096.
+static void NoteMrtSplit(uint32_t slots) {
+	static std::atomic<uint64_t> count {0};
+	const auto                   n = count.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (n <= 4u || (n & 4095u) == 0u) {
+		std::printf("MRT split: draw #%llu runs a second pass for colour slots 0x%x (one surface bound "
+		            "to several slots)\n",
+		            static_cast<unsigned long long>(n), slots);
+	}
+}
 // The draw's colour and depth target resolution (PrepareDrawRenderState; a KYTY_DRAW_RUN
 // continuation whose images changed resolves them late, from the same registers).
 void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -2114,6 +2222,14 @@ void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& d
 	}
 	if (SkipInactivePixelShadersEnabled()) {
 		mrt_mask &= DrawColorOutputFilter(buffer.GetRegisters());
+	}
+	// KYTY_MRT_SPLIT: the first pass of a draw that binds one surface to several slots leaves the
+	// later ones for a second pass (m_mrt_split_slots); the second pass binds only those.
+	mrt_mask &= m_mrt_filter;
+	if (m_mrt_split_allowed && m_mrt_filter == ~0u && (mrt_mask & (mrt_mask - 1u)) != 0 &&
+	    MrtSplitEnabled()) {
+		m_mrt_split_slots = AliasedColorSlots(buffer.GetRegisters(), mrt_mask);
+		mrt_mask &= ~m_mrt_split_slots;
 	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
@@ -2159,6 +2275,32 @@ void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& d
 			state.depth_info = reference;
 		}
 	}
+	// Upstream 7b7294aa0 (TODO PPSA09243): Vulkan passes take one sample count. Where PS5
+	// attachments mix counts, keep those matching the raster count instead of resolving
+	// multisampled shadows. Draws with one sample count (all Astro Bot draws seen) skip this.
+	if (state.color_count != 0 || state.depth_info.image_id) {
+		const auto colors       = std::span {state.color_info, state.color_count};
+		const auto pass_samples = state.depth_info.image_id ? state.depth_info.desc.info.samples
+		                                                    : state.color_info[0].desc.info.samples;
+		if (std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
+			    return color.desc.info.samples != pass_samples;
+		    })) {
+			const auto raster =
+			    render_sample_count(buffer.GetRegisters().GetAaConfig().msaa_num_samples);
+			const auto dropped = std::ranges::remove_if(colors, [&](const RenderColorInfo& color) {
+				return color.desc.info.samples != raster;
+			});
+			state.color_count -= static_cast<uint32_t>(dropped.size());
+			if (state.depth_info.image_id && state.depth_info.desc.info.samples != raster) {
+				state.depth_info = {};
+			}
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog(
+				    "Warning: dropping attachments whose sample count differs from the raster.\n");
+			}
+		}
+	}
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2193,6 +2335,96 @@ static bool DrawRunProgramEligible(const ShaderRecompiler::IR::CompiledShaderInf
 	return true;
 }
 
+// KYTY_PIPELINE_SKIP: whether a draw may be skipped while the driver builds its new pipeline
+// because the picture is all it changes: no stage writes guest memory or images (DrawRunProgramEligible),
+// no guest occlusion query counts its samples, it clears no depth or stencil, it is no mesh draw,
+// and it renders to tiled images only (the CPU reads linear ones back).
+// KYTY_PIPELINE_SKIP_RECURRENT (default on): a skipped draw is lost for good when its target is
+// not drawn again, e.g. a sky or probe texture rendered once at level start (Sky Garden's sky
+// stayed black after a shader-cache invalidation). Only draws whose every target was already a
+// render target in at least two earlier presented frames may be skipped; the others wait.
+static bool SkipRecurrentTargetsOnly() {
+	static const bool on = [] {
+		const auto* value = std::getenv("KYTY_PIPELINE_SKIP_RECURRENT");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
+// Notes the draw's render targets for the rule above (once per image and frame).
+static void NoteSkipTargets(RenderContext& context, const DrawRenderState& state) {
+	auto&      cache = context.GetTextureCache();
+	const auto frame = cache.Frame() + 1u; // 0 = never
+	const auto note  = [&](ImageId id) {
+		if (!id) {
+			return;
+		}
+		auto* image = cache.TryGetImage(id);
+		if (image != nullptr && image->skip_target_frame != frame) {
+			image->skip_target_frame  = frame;
+			image->skip_target_frames = std::min<uint32_t>(image->skip_target_frames + 1u, 1000u);
+		}
+	};
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		note(state.color_info[i].image_id);
+	}
+	note(state.depth_info.image_id);
+}
+
+static bool TargetsRecurrent(RenderContext& context, const DrawRenderState& state) {
+	auto&      cache     = context.GetTextureCache();
+	const auto frame     = cache.Frame() + 1u;
+	const auto recurrent = [&](ImageId id) {
+		if (!id) {
+			return true;
+		}
+		const auto* image = cache.TryGetImage(id);
+		if (image == nullptr) {
+			return false;
+		}
+		// Earlier frames only: the current frame was noted before this check.
+		const auto earlier = image->skip_target_frames - (image->skip_target_frame == frame ? 1u : 0u);
+		return earlier >= 2u;
+	};
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		if (!recurrent(state.color_info[i].image_id)) {
+			return false;
+		}
+	}
+	return recurrent(state.depth_info.image_id);
+}
+
+static bool DrawOnlyChangesPicture(RenderContext& context, const DrawRenderState& state,
+                                   std::span<const ShaderVertexInputInfo> vertex_stages, bool mesh_active) {
+	if (mesh_active || vertex_stages.size() != 1 || context.GetOcclusionCounter().Active()) {
+		return false;
+	}
+	if (SkipRecurrentTargetsOnly() && !TargetsRecurrent(context, state)) {
+		return false;
+	}
+	for (const auto& stage: vertex_stages) {
+		if (stage.stage.program == nullptr || !DrawRunProgramEligible(*stage.stage.program)) {
+			return false;
+		}
+	}
+	if (state.ps_active && (state.ps_input_info.stage.program == nullptr ||
+	                        !DrawRunProgramEligible(*state.ps_input_info.stage.program))) {
+		return false;
+	}
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		if (!state.color_info[i].desc.info.IsTiled()) {
+			return false;
+		}
+	}
+	const auto& depth = state.depth_info;
+	if (static_cast<bool>(depth.image_id) &&
+	    (!depth.desc.info.IsTiled() || depth.depth_clear_enable || depth.load_clear_aspects ||
+	     depth.stencil_clear_enable)) {
+		return false;
+	}
+	return true;
+}
+
 void RenderExecutor::BeginDrawRun() {
 	m_run_prev_valid     = m_run.valid;
 	m_run_keepable       = m_run.valid;
@@ -2200,9 +2432,17 @@ void RenderExecutor::BeginDrawRun() {
 	m_run_active         = false;
 	m_run_recall         = false;
 	m_run_verify         = false;
+	m_run_targets_kept   = false;
+	m_run_pipeswap       = false;
 	m_prepared_validated = false;
 	if (!m_in_engine_commit && DrawRun::Enabled()) {
 		DrawRun::NoteForeignActivity("draw outside an engine commit");
+	}
+	if (DrawRun::KeyDiagEnabled()) [[unlikely]] {
+		m_key_diag.prev_reason = m_key_diag.reason;
+		m_key_diag.reason      = m_in_engine_commit ? DrawRun::KeyDiag::Inelig::NotReached
+		                                            : DrawRun::KeyDiag::Inelig::NotEngine;
+		m_key_diag.combo       = -2;
 	}
 }
 
@@ -2415,15 +2655,123 @@ void RenderExecutor::DrawRunMarkBindings() {
 	}
 }
 
+// KYTY_DRAW_RUN_TARGETS (drawPrep/drawRun.h): the record's targets are what this draw's resolution
+// would give (the same inputs, the run certificate and unchanged attachments).
+bool RenderExecutor::DrawRunTargetsCandidate(const CommandBuffer& buffer, const DrawRenderState& state,
+                                             uint32_t render_target_slice_offset) const {
+	const auto& run   = m_run;
+	const void* pixel = state.ps_active ? state.ps_input_info.stage.program : nullptr;
+	return m_run_prev_valid && !m_run_recall && m_in_engine_commit && run.acquire_valid &&
+	       run.depth.size() == 1 && run.colors.size() == run.color_count &&
+	       m_run_targets_key != 0 && m_run_targets_key == run.targets_key &&
+	       state.ps_active == run.ps_active && pixel == run.pixel_program &&
+	       render_target_slice_offset == run.slice_offset &&
+	       DrawRun::ActivityEpoch() == run.activity && DrawRunCommandUnchanged(buffer) &&
+	       DrawRunImagesUnchanged(true, true);
+}
+
+// KYTY_DRAW_RUN_KEY_DIAG: a draw whose key differed from the record's compares its resolved
+// pipeline and structure with the record's; a draw that recorded becomes the record.
+void RenderExecutor::DrawRunKeyDiagResolved(const CommandBuffer& buffer,
+                                            std::span<PreparedBindings* const> stages,
+                                            const PipelineCache::Pipeline&     pipeline,
+                                            const RenderState& rendering, bool recorded) {
+	auto&       kd     = m_key_diag;
+	const auto  handle = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(static_cast<VkPipeline>(pipeline.pipeline)));
+	std::vector<uint64_t> words;
+	words.reserve(64);
+	const auto add_handle = [&words](auto native) {
+		using Native = typename decltype(native)::NativeType;
+		words.push_back(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(static_cast<Native>(native))));
+	};
+	for (const auto* stage: stages) {
+		words.push_back(reinterpret_cast<uintptr_t>(stage->runtime->program));
+		for (const auto& image: stage->images) {
+			add_handle(image.image_view);
+			words.push_back(static_cast<uint64_t>(image.layout));
+			for (const auto view: image.mip_views) {
+				add_handle(view);
+			}
+		}
+		for (const auto sampler: stage->samplers) {
+			add_handle(sampler);
+		}
+		words.push_back(0xffffffffull);
+	}
+	for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
+		add_handle(rendering.color_attachments[i].image_view);
+		words.push_back(static_cast<uint64_t>(rendering.color_attachments[i].image_layout));
+	}
+	add_handle(rendering.depth_stencil_attachment.image_view);
+	words.push_back(static_cast<uint64_t>(rendering.depth_stencil_attachment.image_layout));
+	const uint64_t structure = XXH3_64bits(words.data(), words.size() * sizeof(uint64_t));
+	if (kd.combo != -2 && kd.record_resolved) {
+		DrawRun::KeyDiag::CountResolved(kd.combo, handle == kd.record_pipeline,
+		                                structure == kd.record_structure);
+	}
+	if (recorded && m_run_parts != nullptr) {
+		kd.record_parts       = *m_run_parts;
+		kd.record_parts_valid = true;
+		kd.record_pipeline    = handle;
+		kd.record_structure   = structure;
+		kd.record_resolved    = true;
+		auto& last = kd.recent[(kd.recent_next + kd.recent.size() - 1) % kd.recent.size()];
+		if (last.key != m_run.key || last.command != m_run.command || last.serial != m_run.rendering_serial) {
+			auto& entry   = kd.recent[kd.recent_next];
+			kd.recent_next = (kd.recent_next + 1) % static_cast<uint32_t>(kd.recent.size());
+			entry         = {m_run.key, m_run.activity, m_run.command, m_run.tick, m_run.rendering_serial};
+		} else {
+			last.activity = m_run.activity;
+			last.tick     = m_run.tick;
+		}
+	} else if (!recorded) {
+		kd.record_parts_valid = false;
+		kd.record_resolved    = false;
+	}
+}
+
 bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRenderState& state,
                                       uint32_t render_target_slice_offset) {
 	using DrawRun::Miss;
 	auto& totals = DrawRun::GetTotals();
 	OwnedCounters::Add(totals.draws, 1);
-	if (!m_run_prev_valid || m_run_key == 0 || m_run_key != m_run.key) {
-		return false;
+	if (m_run_parts != nullptr) [[unlikely]] {
+		// KYTY_DRAW_RUN_KEY_DIAG: why the key check fails.
+		auto& kd = m_key_diag;
+		if (!m_run_prev_valid) {
+			DrawRun::KeyDiag::CountPrevInvalid(kd.prev_reason, m_run_key != 0 && m_run_key == kd.last_key);
+		} else if (m_run_key != 0 && m_run_key != m_run.key && kd.record_parts_valid) {
+			uint32_t mask = 0;
+			for (uint32_t i = 0; i < DrawRun::KpCount; i++) {
+				mask |= (*m_run_parts)[i] != kd.record_parts[i] ? (1u << i) : 0u;
+			}
+			bool recallable = false;
+			bool any        = false;
+			for (const auto& recent: kd.recent) {
+				if (recent.key == m_run_key && recent.command == buffer.Identity() &&
+				    recent.tick == m_context.GetCommandScheduler().CurrentTick() &&
+				    recent.serial != 0 && recent.serial == buffer.ActiveRenderingSerial()) {
+					any        = true;
+					recallable = recallable || recent.activity == DrawRun::ActivityEpoch();
+				}
+			}
+			kd.combo = DrawRun::KeyDiag::CountKeyMismatch(mask, recallable, any);
+		}
+		kd.last_key = m_run_key;
 	}
-	OwnedCounters::Add(totals.key_matches, 1);
+	bool pipeswap = false;
+	if (!m_run_prev_valid || m_run_key == 0 || m_run_key != m_run.key) {
+		// KYTY_DRAW_RUN_PIPESWAP: the key differs in the vertex program alone.
+		if (!m_run_prev_valid || m_run_key == 0 || m_run_swap_key == 0 ||
+		    m_run_swap_key != m_run.swap_key || !DrawRun::PipeSwapEnabled()) {
+			return false;
+		}
+		pipeswap = true;
+		OwnedCounters::Add(totals.swap_matches, 1);
+	} else {
+		OwnedCounters::Add(totals.key_matches, 1);
+	}
 	if (DrawRun::ActivityEpoch() != m_run.activity) {
 		DrawRun::CountMiss(Miss::Activity);
 		return false;
@@ -2444,10 +2792,33 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 	}
 	const void* pixel = state.ps_active ? state.ps_input_info.stage.program : nullptr;
 	if (state.ps_active != m_run.ps_active || render_target_slice_offset != m_run.slice_offset ||
-	    state.vertex_stages_written != 1 || state.vertex_info[0].stage.program != m_run.vertex_program ||
+	    state.vertex_stages_written != 1 ||
+	    (!pipeswap && state.vertex_info[0].stage.program != m_run.vertex_program) ||
 	    pixel != m_run.pixel_program) {
 		DrawRun::CountMiss(Miss::Programs);
 		return false;
+	}
+	bool swap_writes = false;
+	if (pipeswap) {
+		const auto* recorded = static_cast<const ShaderRecompiler::IR::CompiledShaderInfo*>(
+		    m_run.vertex_program);
+		const auto& program = *state.vertex_info[0].stage.program;
+		if (recorded == nullptr || recorded == &program || !DrawRunPipeSwapCompatible(*recorded, program)) {
+			OwnedCounters::Add(totals.swap_incompatible, 1);
+			return false;
+		}
+		// The new vertex program: run-eligible, and its buffer writes (if allowed) off the run's images.
+		if (!DrawRunProgramEligible(program)) {
+			if (!m_run.record_writes_ok || !DrawRunProgramEligible(program, true)) {
+				DrawRun::CountMiss(Miss::Writes);
+				return false;
+			}
+			switch (DrawRunWritesOverRun(state.vertex_info[0].stage, m_run.images)) {
+				case 0: break;
+				case 1: swap_writes = true; break;
+				default: DrawRun::CountMiss(Miss::Writes); return false;
+			}
+		}
 	}
 	// KYTY_DRAW_RUN_WRITES: a record of a writing program exists only while the switch is on (a
 	// change ends the run). The candidate's own writes must not lie over an image of the run.
@@ -2467,10 +2838,47 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 		}
 	}
 	OwnedCounters::Add(totals.continued, 1);
-	if (writes) {
+	if (writes || swap_writes) {
 		OwnedCounters::Add(totals.write_continued, 1);
 	}
+	if (pipeswap) {
+		OwnedCounters::Add(totals.swapped, 1);
+		m_run_pipeswap = true;
+	}
 	return true;
+}
+
+bool RenderExecutor::DrawRunPipeSwapCompatible(const ShaderRecompiler::IR::CompiledShaderInfo& recorded,
+                                               const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	const auto& a = recorded.info;
+	const auto& b = program.info;
+	if (a.images.size() != b.images.size() || a.samplers.size() != b.samplers.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < a.images.size(); i++) {
+		auto x = a.images[i];
+		auto y = b.images[i];
+		x.source = y.source = 0;
+		x.first_use_pc = y.first_use_pc = 0;
+		if (!(x == y)) {
+			return false;
+		}
+	}
+	for (size_t i = 0; i < a.samplers.size(); i++) {
+		auto x = a.samplers[i];
+		auto y = b.samplers[i];
+		x.source = y.source = 0;
+		x.first_use_pc = y.first_use_pc = 0;
+		if (!(x == y)) {
+			return false;
+		}
+	}
+	const auto viewport_index = [](const auto& outputs) {
+		return std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
+			return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+		});
+	};
+	return viewport_index(a.outputs) == viewport_index(b.outputs);
 }
 
 // KYTY_DRAW_RUN_RECALL: a hash of a binding's mip views (RecallTexture::mips).
@@ -2728,7 +3136,8 @@ bool RenderExecutor::DrawRunAcquireCandidate(const CommandBuffer&               
 
 bool RenderExecutor::DrawRunPartialPush(const CommandBuffer&           buffer,
                                         const PipelineCache::Pipeline& pipeline) const {
-	return DrawRun::PushPartialEnabled() && !m_run_recall && pipeline.uses_push_descriptors &&
+	return DrawRun::PushPartialEnabled() && !m_run_recall && !m_run_pipeswap &&
+	       pipeline.uses_push_descriptors &&
 	       m_run.push_valid &&
 	       m_run.push_layout == pipeline.pipeline_layout &&
 	       buffer.DescriptorEpoch(vk::PipelineBindPoint::eGraphics) == m_run.push_epoch;
@@ -2746,6 +3155,8 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	}
 	auto& run            = m_run;
 	run.key              = m_run_key;
+	run.targets_key      = m_run_targets_key;
+	run.swap_key         = m_run_swap_key;
 	run.activity         = DrawRun::ActivityEpoch();
 	run.command          = buffer.Identity();
 	run.tick             = m_context.GetCommandScheduler().CurrentTick();
@@ -2753,7 +3164,13 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	// The draw's push (whole or partial) is the last descriptor command at the bind point.
 	run.push_epoch = buffer.DescriptorEpoch(vk::PipelineBindPoint::eGraphics);
 	if (m_run_active) {
-		// A continuation changed none of the recorded images, targets or bindings.
+		// A continuation changed none of the recorded images, targets or bindings; a pipeline swap
+		// changed the vertex program and the pipeline (layout) the next draw is compared with.
+		if (m_run_pipeswap) {
+			run.vertex_program = state.vertex_info[0].stage.program;
+			run.push_valid     = pipeline.uses_push_descriptors;
+			run.push_layout    = pipeline.pipeline_layout;
+		}
 		run.valid = true;
 		return;
 	}
@@ -2785,6 +3202,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 			    depth->feedback_instance == run.rendering_serial &&
 			    depth->feedback_serial == depth->ContentSerial()) {
 				DrawRun::GetTotals().depth_promotions_excluded.fetch_add(1, std::memory_order_relaxed);
+				m_key_diag.reason = DrawRun::KeyDiag::Inelig::DepthPromotion;
 				return;
 			}
 		}
@@ -2819,6 +3237,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	for (const auto& mark: run.images) {
 		if (mark.texture && DrawRunOverAttachment(attachments, mark.address, mark.size)) {
 			DrawRun::GetTotals().alias_excluded.fetch_add(1, std::memory_order_relaxed);
+			m_key_diag.reason = DrawRun::KeyDiag::Inelig::Alias;
 			return;
 		}
 	}
@@ -3045,6 +3464,64 @@ bool DrawPrep::ProgramBarrierSafe(const ShaderRecompiler::IR::CompiledShaderInfo
 		    (binding.kind == Kind::MipStats && !(plain_pixel && program.stage == ShaderType::Pixel))) {
 			return false;
 		}
+	}
+	return true;
+}
+
+// DB_RENDER_CONTROL.COPY_DEPTH_TO_COLOR (upstream 1029511bb): a rect-list draw that copies the
+// depth target into the R32F colour target (VK_KHR_maintenance8 depth/colour image copy).
+bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                       const DrawEmitInfo& emit, DrawRenderState& state) {
+	if (!buffer.GetRegisters().GetRenderControl().copy_depth_to_color) {
+		return false;
+	}
+	auto& ucfg = buffer.GetUserConfig();
+	const auto& hw = buffer.GetRegisters();
+	auto& depth = state.depth_info;
+	auto& color = state.color_info[0];
+	EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().maintenance8_enabled ||
+	                     !Prospero::IsRectList(ucfg.GetPrimType()) ||
+	                     draw.IsIndexed() || draw.index_count != 3 || draw.instance_count != 1 ||
+	                     emit.first_vertex != 0 || emit.first_instance != 0 ||
+	                     state.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
+	                     color.desc.info.samples != 1 ||
+	                     depth.desc.info.extent.width != color.Extent().width ||
+	                     depth.desc.info.extent.height != color.Extent().height ||
+	                     depth.desc.view_info.layer_count != 1 ||
+	                     color.desc.view_info.layer_count != 1 ||
+	                     hw.GetBlendControl(0).enable || state.ps_input_info.ps_pixel_kill_enable ||
+	                     state.ps_input_info.ps_depth_export_enable ||
+	                     state.ps_input_info.ps_sample_mask_export_enable);
+	vk::ImageAspectFlags feedback;
+	const auto rendering = AcquireRenderTargets(buffer, &color, 1, depth, feedback);
+	if (depth.load_clear_aspects) {
+		m_context.GetCommandScheduler().BeginRendering(rendering);
+	}
+	auto& cache = m_context.GetTextureCache();
+	auto& source = cache.GetImage(depth.image_id);
+	auto& destination = cache.GetImage(color.image_id);
+	EXIT_NOT_IMPLEMENTED((source.backing.format != vk::Format::eD32Sfloat &&
+	                      source.backing.format != vk::Format::eD32SfloatS8Uint) ||
+	                     destination.backing.format != vk::Format::eR32Sfloat);
+	const auto rect = calc_final_scissor(hw.GetScreenViewport(), hw.GetScanModeControl(),
+	                                    {rendering.width, rendering.height}, 0);
+	if (rect.right > rect.left && rect.bottom > rect.top) {
+		const vk::ImageCopy region {
+		    {vk::ImageAspectFlagBits::eDepth, depth.desc.view_info.base_level,
+		     depth.desc.view_info.base_layer, 1}, {rect.left, rect.top, 0},
+		    {vk::ImageAspectFlagBits::eColor, color.desc.view_info.base_level,
+		     color.desc.view_info.base_layer, 1}, {rect.left, rect.top, 0},
+		    {static_cast<uint32_t>(rect.right - rect.left),
+		     static_cast<uint32_t>(rect.bottom - rect.top), 1}};
+		m_context.GetCommandScheduler().EndRendering();
+		const auto command = buffer.Handle();
+		source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+		               {}, command);
+		destination.Transit(vk::ImageLayout::eTransferDstOptimal,
+		                    vk::AccessFlagBits2::eTransferWrite, {}, command);
+		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		                  1, &region);
 	}
 	return true;
 }
@@ -3361,6 +3838,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		OcclusionCounter::DebugLog("e n=%u inst=%u vs=0x%" PRIx64 "\n", draw.index_count, draw.instance_count,
 		                           buffer.GetShaders().GetVs().es_regs.data_addr);
 	}
+	if (CopyDepthToColor(buffer, draw, emit, state)) {
+		m_run_active = false; // the copy is not a draw of the run
+		return;
+	}
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	// CommitStats: image transitions recorded while this draw is committed.
@@ -3559,11 +4040,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// rendering instance (recording one ends rendering, which a continuation never does).
 	const bool run_indirect_barrier =
 	    indirect != nullptr && buffer.ActiveRenderingSerial() != m_indirect_barrier_rendering;
-	if (m_run_active && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true) ||
-	                     run_indirect_barrier)) {
+	// KYTY_DRAW_RUN_TARGETS: kept targets whose attachments changed during the buffer work are
+	// resolved now, with the same repeated binding work as a continuation's fallback.
+	const bool targets_late = m_run_targets_kept &&
+	                          (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true, true));
+	if (targets_late) {
+		m_run_targets_kept = false;
+		OwnedCounters::Add(DrawRun::GetTotals().targets_late, 1);
+	}
+	if (targets_late || (m_run_active && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true) ||
+	                                      run_indirect_barrier))) {
 		const CommitStats::SubScope late_scope(CommitStats::Sub::LateFallback);
-		DrawRun::GetTotals().late_fallbacks.fetch_add(1, std::memory_order_relaxed);
-		DrawRun::CountMiss(DrawRun::Miss::Images);
+		if (!targets_late) {
+			DrawRun::GetTotals().late_fallbacks.fetch_add(1, std::memory_order_relaxed);
+			DrawRun::CountMiss(DrawRun::Miss::Images);
+		}
 		m_run_active = false;
 		DrawRunRecallFallback();
 		DrawRunTargets(buffer, draw, m_run_slice_offset, state);
@@ -3589,6 +4080,36 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		index_binding = PrepareIndexBuffer(buffer, index_source);
 		if (indirect != nullptr) {
 			indirect_buffers = ObtainIndirectBuffers(buffer, *indirect);
+		}
+	}
+	// KYTY_REBIND_AFTER_JOIN: a buffer the bindings resolved was retired since (a later lookup of
+	// this draw - another binding, a vertex, index or argument range - joined it into a new
+	// buffer): the recorded draw would read and write a buffer nothing uses again, its writes lost
+	// while the range stays GPU-owned. Resolve the buffers and the per-draw ranges again while the
+	// count moves (at most 4 times).
+	if (RebindAfterJoinEnabled()) {
+		auto& cache = m_context.GetBufferCache();
+		for (uint32_t pass = 0; pass < 4 && cache.UnregisterEpoch() != m_rebind_epoch; pass++) {
+			NoteRebindAfterJoin("draw", draw.Name());
+			m_rebind_epoch = cache.UnregisterEpoch();
+			{
+				const BufferCache::UploadBatch upload_batch(cache);
+				for (auto* stage: stages) {
+					RebindBuffers(*stage);
+				}
+			}
+			if (!mesh_active) {
+				vertex_bindings = PreparedVertexBuffers {};
+				if (CpCommit::Enabled(CpCommit::Part::Draws)) {
+					AcquireVertexBuffersInto(buffer, state.vertex_info[0], nullptr, vertex_bindings);
+				} else {
+					vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0], nullptr);
+				}
+				index_binding = PrepareIndexBuffer(buffer, index_source);
+			}
+			if (indirect != nullptr) {
+				indirect_buffers = ObtainIndirectBuffers(buffer, *indirect);
+			}
 		}
 	}
 	// KYTY_DRAW_RUN=verify: whether the kept images would have passed the check above (the normal
@@ -3635,6 +4156,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// built for and no pipeline was replaced since (DrawPrep::PlannedPipeline).
 	auto&       pipeline_cache = m_context.GetPipelineCache();
 	const auto  colors_span    = std::span<const RenderColorInfo> {state.color_info, state.color_count};
+	if (pipeline_cache.PipelineSkipEnabled() && SkipRecurrentTargetsOnly()) {
+		NoteSkipTargets(m_context, state);
+	}
 	const auto* ps_input       = state.ps_active ? &state.ps_input_info : nullptr;
 	const auto* planned_pipeline =
 	    plan_stages && plan->pipeline != nullptr
@@ -3645,9 +4169,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (planned_pipeline != nullptr && !plan_verify) {
 		pipeline_cache.NotePlannedPipeline(state.depth_info, ps_input);
 	} else {
-		pipeline_object = &pipeline_cache.GetGraphicsPipeline(
+		const bool skippable = planned_pipeline == nullptr && pipeline_cache.PipelineSkipEnabled() &&
+		                       DrawOnlyChangesPicture(m_context, state, vertex_stages, mesh_active);
+		pipeline_object = pipeline_cache.TryGetGraphicsPipeline(
 		    colors_span, state.depth_info, vertex_stages, buffer, ps_input, topology,
-		    primitive_restart_enable, *programs);
+		    primitive_restart_enable, *programs, skippable);
+		if (pipeline_object == nullptr) {
+			// KYTY_PIPELINE_SKIP: skipped until its pipeline is built. Nothing was recorded; no
+			// draw-run record may be continued or recalled across it (its bindings replaced the
+			// record's).
+			m_run.valid        = false;
+			m_run_active       = false;
+			m_run_targets_kept = false;
+			for (auto& record: m_run_kept) {
+				record.valid = false;
+			}
+			return;
+		}
 		if (planned_pipeline != nullptr) {
 			DrawPrep::CountBindingVerifyCheck();
 			// A pipeline replaced after the certificate check is a race, not a difference.
@@ -3814,7 +4352,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// vertex program as the previous draw's, which recorded it into this command buffer; the
 	// shadow shows nothing replaced it since (another pipeline bind or command buffer).
 	// A recall records it again: the draws in between left their own.
-	const bool run_dynamic = (m_run_active || m_run_verify) && !m_run_recall &&
+	const bool run_dynamic = (m_run_active || m_run_verify) && !m_run_recall && !m_run_pipeswap &&
 	                         DynamicStateShadowEnabled() &&
 	                         m_dynamic_state.valid && m_dynamic_state.command == vk_buffer.Identity() &&
 	                         m_dynamic_state.pipeline != nullptr &&
@@ -3911,6 +4449,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwords(
 	                      state.vertex_info[0].mesh.split_groups != 0)
 	                : 0u;
+	// PA_CL_UCP planes (upstream feed075a9): four float dwords per plane up to the highest enabled.
+	if (const auto planes = state.vertex_info[0].user_clip_planes; planes != 0) {
+		uint32_t count = 0;
+		for (uint32_t mask = planes; mask != 0; mask >>= 1u) {
+			count++;
+		}
+		vk_buffer.pushConstants(
+		    pipeline.pipeline_layout,
+		    vk::ShaderStageFlagBits::eFragment |
+		        (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex),
+		    ShaderRecompiler::IR::PushData::UserClipPlaneDword * sizeof(uint32_t),
+		    count * 4u * sizeof(uint32_t), buffer.GetRegisters().GetUserClipPlanes().data());
+	}
 	if (mesh_indirect) {
 		// One indirect dispatch per conversion record, each reading its draw dwords from its own
 		// parameter block (a record the draw does not need has no workgroups). Indirect draws are
@@ -4087,7 +4638,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		// KYTY_DRAW_RUN_CONT_ELIGIBLE (drawRun.h): a continuation's per-stage part is its record's.
 		const auto cont_mode  = DrawRun::ContEligibleMode();
-		const bool cont_known = cont_mode != 0 && m_run_active && m_run.record_writes_ok == writes_ok;
+		const bool cont_known = cont_mode != 0 && m_run_active && !m_run_pipeswap &&
+		                        m_run.record_writes_ok == writes_ok;
 		const auto stages_eligible = [&] {
 			bool ok = true;
 			for (const auto* stage: stages) {
@@ -4120,6 +4672,59 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				}
 			}
 		}
+		if (DrawRun::KeyDiagEnabled()) [[unlikely]] {
+			using DrawRun::KeyDiag::Inelig;
+			auto reason = Inelig::None;
+			if (!eligible) {
+				bool color_clear = false;
+				for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
+					color_clear = color_clear || rendering.color_attachments[i].is_clear;
+				}
+				reason = !m_in_engine_commit                                          ? Inelig::NotEngine
+				         : !m_prepared_validated                                      ? Inelig::NotValidated
+				         : m_run_key == 0                                             ? Inelig::NoKey
+				         : mesh_active                                                ? Inelig::Mesh
+				         : (indirect != nullptr && !DrawRun::IndirectRunsEnabled())   ? Inelig::Indirect
+				         : vertex_stages.size() != 1                                  ? Inelig::VertexStages
+				         : (shader_write_stages && !writes_ok)                        ? Inelig::Writes
+				         : feedback_aspects                                           ? Inelig::Feedback
+				         : buffer.ActiveRenderingSerial() == 0                        ? Inelig::NoRendering
+				         : !RenderStateFastEnabled(RenderStatePart::Reset)            ? Inelig::RenderState
+				         : graphics_debug_dump_enabled()                              ? Inelig::DebugDump
+				         : rendering.depth_stencil_attachment.depth_clear             ? Inelig::DepthClear
+				         : rendering.depth_stencil_attachment.stencil_clear           ? Inelig::StencilClear
+				         : color_clear                                                ? Inelig::ColorClear
+				                                                                      : Inelig::Count;
+				if (reason == Inelig::Count) {
+					for (const auto* stage: stages) {
+						if (reason != Inelig::Count) {
+							break;
+						}
+						if (stage->gds.buffer != nullptr) {
+							reason = Inelig::Gds;
+						} else if (!DrawRunProgramEligible(*stage->runtime->program, writes_ok)) {
+							reason = Inelig::Program;
+						} else {
+							for (const auto& binding: stage->images) {
+								if (is_attachment(binding.image_id)) {
+									reason = Inelig::TexAttachment;
+									break;
+								}
+								if (binding.desc.type == TextureCache::BindingType::Storage) {
+									reason = Inelig::Storage;
+									break;
+								}
+							}
+						}
+					}
+					if (reason == Inelig::Count) {
+						reason = Inelig::NotReached; // not found: shown as "notreached"
+					}
+				}
+				DrawRun::KeyDiag::CountIneligible(reason);
+			}
+			m_key_diag.reason = reason;
+		}
 		if (eligible) {
 			OwnedCounters::Add(DrawRun::GetTotals().eligible, 1);
 			const bool program_writes =
@@ -4135,6 +4740,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			if (!continued) {
 				m_run.record_writes_ok = writes_ok;
 			}
+		}
+		if (DrawRun::KeyDiagEnabled()) [[unlikely]] {
+			DrawRunKeyDiagResolved(buffer, stages, pipeline, rendering, eligible && m_run.valid);
 		}
 	}
 	CommitStats::StepMark(CommitStats::Step::RunRecord);
@@ -4255,7 +4863,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	state.Reset();
 	CommitStats::StepMark(CommitStats::Step::StateReset);
 	CommitStats::Mark(CommitStats::Phase::Setup);
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	m_mrt_split_slots   = 0;
+	m_mrt_split_allowed = true;
+	const bool prepared = PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state);
+	m_mrt_split_allowed = false;
+	if (!prepared) {
+		m_mrt_split_slots = 0;
 		ResetBindings();
 		return;
 	}
@@ -4292,6 +4905,22 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    primitive_restart);
 	ResetBindings();
 	CommitStats::StepMark(CommitStats::Step::ResetBindings);
+	if (const auto split = std::exchange(m_mrt_split_slots, 0u); split != 0u) {
+		// KYTY_MRT_SPLIT: the second pass, with only the slots the first left out.
+		NoteMrtSplit(split);
+		m_run.valid = false;
+		BeginDrawRun();
+		state.Reset();
+		m_mrt_filter = split;
+		if (PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+			ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
+			                    primitive_restart);
+		}
+		m_mrt_filter = ~0u;
+		ResetBindings();
+		m_run.valid = false;
+		BeginDrawRun();
+	}
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -4367,7 +4996,12 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	state.Reset();
 	CommitStats::StepMark(CommitStats::Step::StateReset);
 	CommitStats::Mark(CommitStats::Phase::Setup);
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	m_mrt_split_slots   = 0;
+	m_mrt_split_allowed = true;
+	const bool prepared = PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state);
+	m_mrt_split_allowed = false;
+	if (!prepared) {
+		m_mrt_split_slots = 0;
 		ResetBindings();
 		return;
 	}
@@ -4382,6 +5016,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 			     state.ps_input_info.input_num, sh_ctx.GetPs().ps_regs.data_addr,
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
+		m_mrt_split_slots = 0;
 		ResetBindings();
 		return;
 	}
@@ -4401,6 +5036,21 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
 	ResetBindings();
 	CommitStats::StepMark(CommitStats::Step::ResetBindings);
+	if (const auto split = std::exchange(m_mrt_split_slots, 0u); split != 0u) {
+		// KYTY_MRT_SPLIT: the second pass, with only the slots the first left out.
+		NoteMrtSplit(split);
+		m_run.valid = false;
+		BeginDrawRun();
+		state.Reset();
+		m_mrt_filter = split;
+		if (PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+			ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
+		}
+		m_mrt_filter = ~0u;
+		ResetBindings();
+		m_run.valid = false;
+		BeginDrawRun();
+	}
 }
 
 // Mirrors DrawIndex/DrawAuto with DrawOffsetSource::IndirectArgs, except that the counts, first

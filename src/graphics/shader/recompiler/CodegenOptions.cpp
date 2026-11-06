@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -26,11 +27,20 @@ CodegenOptions FromEnvironment() {
 	options.uniform_lane_reads = EnvFlag("KYTY_UNIFORM_LANE_READS", options.uniform_lane_reads);
 	options.short_f32_helpers  = EnvFlag("KYTY_SHORT_F32_HELPERS", options.short_f32_helpers);
 	options.fast_float_min_max = EnvFlag("KYTY_FAST_FMINMAX", options.fast_float_min_max);
+	options.native_float_min_max = EnvFlag("KYTY_NATIVE_FMINMAX", options.native_float_min_max);
+	options.dcache_invalidate = EnvFlag("KYTY_DCACHE_INV", options.dcache_invalidate);
+	options.readfirstlane_exec_zero =
+	    EnvFlag("KYTY_READFIRSTLANE_EXEC0", options.readfirstlane_exec_zero);
+	options.uniform_buffers      = EnvFlag("KYTY_UNIFORM_BUFFERS", options.uniform_buffers);
+	options.wave64_warps         = EnvFlag("KYTY_WAVE64_WARPS", options.wave64_warps);
 	options.fast_pkrtz         = EnvFlag("KYTY_FAST_PKRTZ", options.fast_pkrtz);
 	options.single_f2i_saturation =
 	    EnvFlag("KYTY_SINGLE_F2I_SATURATION", options.single_f2i_saturation);
 	options.lod_stats_gate = EnvFlag("KYTY_LOD_STATS_GATE", options.lod_stats_gate);
 	options.robust_buffer_loads = EnvFlag("KYTY_ROBUST_BUFFER_LOADS", options.robust_buffer_loads);
+	options.branchless_loads    = EnvFlag("KYTY_BRANCHLESS_LOADS", options.branchless_loads);
+	options.branchless_lds      = EnvFlag("KYTY_BRANCHLESS_LDS", options.branchless_lds);
+	options.lane_local          = EnvFlag("KYTY_LANE_LOCAL", options.lane_local);
 	options.readonly_buffers    = EnvFlag("KYTY_READONLY_BUFFERS", options.readonly_buffers);
 	options.interp_modes = EnvFlag("KYTY_INTERP_MODES", options.interp_modes);
 	options.sample_offsets = EnvFlag("KYTY_SAMPLE_OFFSETS", options.sample_offsets);
@@ -50,6 +60,7 @@ CodegenOptions FromEnvironment() {
 	options.ps_helper_atomics_skip =
 	    EnvFlag("KYTY_PS_HELPER_ATOMICS_SKIP", options.ps_helper_atomics_skip);
 	options.volatile_loads         = EnvFlag("KYTY_VOLATILE_LOADS", options.volatile_loads);
+	options.cfg_clone_exits = EnvFlag("KYTY_CFG_CLONE_EXITS", options.cfg_clone_exits);
 	if (const auto* list = std::getenv("KYTY_LOOP_GUARD_SHADERS"); list != nullptr) {
 		options.loop_guard_all = std::strcmp(list, "all") == 0 || std::strcmp(list, "*") == 0;
 		std::string_view text(options.loop_guard_all ? "" : list);
@@ -142,6 +153,30 @@ CodegenOptions& Storage() {
 }
 
 } // namespace
+
+namespace {
+std::atomic<bool> g_host_compute_subgroups_32 {false};
+} // namespace
+
+void SetHostComputeSubgroups32(bool fixed_32) {
+	g_host_compute_subgroups_32.store(fixed_32, std::memory_order_relaxed);
+}
+
+bool GetHostComputeSubgroups32() {
+	return g_host_compute_subgroups_32.load(std::memory_order_relaxed);
+}
+
+namespace {
+std::atomic<bool> g_host_uniform_buffer_robust {false};
+} // namespace
+
+void SetHostUniformBufferRobust(bool robust) {
+	g_host_uniform_buffer_robust.store(robust, std::memory_order_relaxed);
+}
+
+bool GetHostUniformBufferRobust() {
+	return g_host_uniform_buffer_robust.load(std::memory_order_relaxed);
+}
 
 const CodegenOptions& GetCodegenOptions() {
 	return Storage();

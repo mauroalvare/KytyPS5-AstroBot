@@ -3,8 +3,10 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/crashContext.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/guestProbe.h"
 #include "common/hangTrace.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
@@ -29,6 +31,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +42,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -95,16 +99,6 @@ ThreadLocalStorage::~ThreadLocalStorage() {
 		FreeTlsBlock(&block);
 	}
 }
-
-#pragma pack(1)
-
-struct EntryParams {
-	int         argc;
-	uint32_t    pad;
-	const char* argv[3];
-};
-
-#pragma pack()
 
 using atexit_func_t = KYTY_SYSV_ABI void (*)();
 using entry_func_t  = KYTY_SYSV_ABI void (*)(EntryParams* params, atexit_func_t atexit_func);
@@ -279,6 +273,7 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 // Returns 0 (rax and xmm0, see the thunk). Reported per import: its first call, then its call
 // count at powers of ten from 1,000 (UnresolvedImportLog).
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_address) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	auto*      record = reinterpret_cast<StubbedImportRecord*>(record_address);
 	const auto call   = record->calls.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (UnresolvedImportLog::ReportFirst(call)) {
@@ -362,9 +357,7 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             "pushq %%r15\n\t"
 		             "movq %%gs:0x08, %%r14\n\t"
 		             "movq %%gs:0x10, %%r15\n\t"
-		             "xorq %%rcx, %%rcx\n\t"
-		             "movq %%rcx, %%gs:0x08\n\t"
-		             "movq %%rcx, %%gs:0x10\n\t"
+		             KYTY_GUEST_TEB_STACK_RANGE_ASM("%[teb_range]")
 		             "movq %%rsp, %%r12\n\t"
 		             "movq %%rbp, %%r13\n\t"
 		             "movq %[guest_rsp], %%rsp\n\t"
@@ -379,7 +372,8 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             "popq %%r13\n\t"
 		             "popq %%r12\n\t"
 		             : [guest_rsp] "+r"(guest_rsp_reg), [guest_rbp] "+r"(guest_rbp_reg)
-		             : [func] "r"(func_reg), "D"(params), "S"(atexit_func)
+		             : [func] "r"(func_reg), "D"(params), "S"(atexit_func),
+		               [teb_range] "m"(Common::HostException::g_guest_teb_stack_range)
 		             : "cc", "memory", "rax", "rcx", "rdx", "r10", "r11", "xmm0", "xmm1", "xmm2",
 		               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 		               "xmm12", "xmm13", "xmm14", "xmm15");
@@ -514,7 +508,15 @@ bool TestMainEntryUsesGuestStack() {
 	             : "=r"(restored_teb_stack_base), "=r"(restored_teb_stack_limit)
 	             :
 	             : "memory");
-	const bool teb_ok = state.teb_stack_base == 0 && state.teb_stack_limit == 0 &&
+	// Zeros, or with KYTY_GUEST_TEB_STACK_RANGE=1 and the host stack above the guest stacks'
+	// region, that region (hostException.h).
+	uintptr_t deallocation_stack = 0;
+	asm volatile("movq %%gs:0x1478, %0" : "=r"(deallocation_stack) : : "memory");
+	const bool teb_range = Common::HostException::g_guest_teb_stack_range != 0 &&
+	                       deallocation_stack >= Common::HostException::GuestStacksHigh;
+	const bool teb_ok =
+	    state.teb_stack_base == (teb_range ? Common::HostException::GuestStacksHigh : 0) &&
+	    state.teb_stack_limit == (teb_range ? Common::HostException::GuestStacksLow : 0) &&
 	                    restored_teb_stack_base == original_teb_stack_base &&
 	                    restored_teb_stack_limit == original_teb_stack_limit;
 #else
@@ -770,9 +772,32 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 	if (Libs::Graphics::FaultCost::MapEnabled()) {
 		Libs::Graphics::FaultCost::SetFaultInstruction(info->exception_address);
 	}
-	// The faulting instruction runs again when this handler returns (KYTY_READBACK_SIDE_WRITES).
+	// The faulting instruction runs again when this handler returns (KYTY_READBACK_SIDE_WRITES),
+	// unless the handler completes a load itself (KYTY_READ_FAULT_PUBLISHED, common/guestLoad.h).
 	const Libs::Graphics::FaultCost::RetriedFaultScope retried;
+	static const bool guest_load_registered = [] {
+		GuestLoad::Register(&Loader::X64InstructionEmulator::DecodeGuestLoad,
+		                    &Loader::X64InstructionEmulator::ApplyGuestLoad);
+		return true;
+	}();
+	(void)guest_load_registered;
+	// Only guest code's loads: emulator code reading guest memory must keep synchronizing through
+	// the fault (Windows: an address in no loaded module is guest or generated guest code).
+	bool guest_code = false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (access == GpuAccess::Read) {
+		HMODULE module = nullptr;
+		guest_code     = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		                                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                                    reinterpret_cast<LPCWSTR>(info->exception_address),
+		                                    &module) == 0;
+	}
+#endif
+	const GuestLoad::FaultScope guest_load(guest_code ? info->native_context : nullptr);
 	const bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+	if (handled) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+	}
 	if (HangTrace::Enabled()) {
 		HangTrace::ClearFaultContext();
 	}
@@ -842,6 +867,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::EmulatedInstructions);
 		return true;
 	}
 
@@ -901,6 +927,27 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				append("{} {:016x}", (i % 4 == 0) ? "\n " : "", stack[i]);
 			}
 			append("\n");
+		}
+		{
+			// The first 64 bytes at each register that points to readable memory: the object a
+			// guest assert checked (Astro Bot's "too many objects/batches" assert has its command
+			// buffer writer in rbx: bottom, top, cursor_up, cursor_down, callback, user data,
+			// reserved dwords).
+			const std::pair<const char*, uint64_t> registers[] = {
+			    {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx},
+			    {"rsi", info->rsi}, {"rdi", info->rdi}, {"r12", info->r12}, {"r13", info->r13},
+			    {"r14", info->r14}, {"r15", info->r15}};
+			for (const auto& [name, value]: registers) {
+				if (value < 0x10000 || (value & 7u) != 0 || !IsReadableRange(value, 64)) {
+					continue;
+				}
+				const auto* words = reinterpret_cast<const uint64_t*>(value);
+				append("[{}]:", name);
+				for (int i = 0; i < 8; i++) {
+					append(" {:016x}", words[i]);
+				}
+				append("\n");
+			}
 		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// The faulting host call chain, unwound from the fault context, with each frame's module and
@@ -1508,6 +1555,12 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
+	if (!m_programs.empty()) {
+		GamePatch::ApplyBuiltin(m_programs.front());
+	}
+	if (!m_programs.empty() && !m_programs.front()->elf->IsShared()) {
+		Common::GuestProbe::Arm(m_programs.front()->base_vaddr, m_programs.front()->base_size);
+	}
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}
@@ -1515,11 +1568,16 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
 	if (auto entry = GetEntry(); entry != 0) {
+		const auto& arguments = Config::GetGuestArguments();
+		const auto params_size = offsetof(EntryParams, argv) +
+		                         (arguments.size() + 2) * sizeof(const char*);
 		auto* params = reinterpret_cast<EntryParams*>(
-		    (reinterpret_cast<uintptr_t>(main_stack_top) - 0x100u) & ~static_cast<uintptr_t>(0x0f));
-		std::memset(params, 0, sizeof(EntryParams));
-		params->argc    = 1;
-		params->argv[0] = "KytyEmu";
+		    (reinterpret_cast<uintptr_t>(main_stack_top) - params_size - 0x100u) &
+		    ~static_cast<uintptr_t>(0x0f));
+		std::memset(params, 0, params_size);
+		for (const auto& argument: arguments) {
+			params->argv[params->argc++] = argument.c_str();
+		}
 
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 

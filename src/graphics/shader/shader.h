@@ -8,6 +8,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <array>
+#include <cstring>
 #include <cstddef>
 #include <span>
 #include <string>
@@ -68,6 +69,18 @@ inline uint8_t GetDstSel(uint32_t swizzle, uint32_t channel) {
 	return (swizzle >> (channel * 3u)) & 0x7u;
 }
 
+[[nodiscard]] inline bool IsValidImageSwizzle(uint32_t swizzle,
+                                             uint32_t component_count = 4) noexcept {
+	if ((swizzle & ~0xfffu) != 0) {
+		return false;
+	}
+	for (uint32_t channel = 0; channel < 4; channel++) {
+		const auto selector = GetDstSel(swizzle, channel);
+		if (selector > 1 && (selector < 4 || selector >= 4 + component_count)) return false;
+	}
+	return true;
+}
+
 struct ShaderClipSpaceTransform {
 	float scale[2]       = {};
 	float offset[2]      = {};
@@ -124,6 +137,8 @@ struct ShaderTessellationInputInfo {
 	uint32_t output_control_points = 0;
 	uint32_t ls_stride             = 0;
 	uint32_t hs_stride             = 0;
+	uint32_t patch_base            = 0;
+	uint32_t patch_size            = 0;
 	uint32_t domain                = 0;
 	uint32_t partitioning          = 0;
 	uint32_t output_topology       = 0;
@@ -143,7 +158,11 @@ struct ShaderVertexInputInfo {
 	int                     buffers_num         = 0;
 	uint32_t                wave_size           = 64;
 	uint32_t                scratch_size_dwords = 0;
+	// LDS_SIZE of the GS stage a non-NGG vertex shader runs on; usually zero.
+	uint32_t                lds_size_dwords     = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
+	// PA_CL_CLIP_CNTL.UCP_ENA; set only on the last pre-rasterization stage.
+	uint32_t                user_clip_planes     = 0;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
@@ -181,10 +200,14 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
+	// Last before the runtime field: the fields above keep the offsets older shader journals and
+	// pipeline lists stored.
+	bool               async_compute              = false;
 	ShaderStageRuntime stage;
 };
 
 enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
+enum class ShaderPixelParameterMode : uint8_t { FirstVertex, LastVertex, Rectangle };
 
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
@@ -205,11 +228,17 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
+	// EXTRA_LDS_SIZE: LDS reserved beyond the interpolants (VGPR spills to LDS).
+	uint32_t                                       lds_size_dwords              = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
 	bool                                           ps_pos_z                     = false;
 	bool                                           ps_pos_w                     = false;
-	bool                                           ps_front_face                = false;
+	// One byte, as ps_front_face alone was: journals and pipeline lists keep their layout (stored
+	// values 0/1 read as all-bits off). all_bits: SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS selects
+	// uint masks instead of float +/-1.
+	bool                                           ps_front_face          : 1  = false;
+	bool                                           ps_front_face_all_bits : 1  = false;
 	bool                                           ps_ancillary                 = false;
 	bool                                           ps_no_perspective            = false;
 	bool                                           ps_pixel_kill_enable         = false;
@@ -221,10 +250,32 @@ struct ShaderPixelInputInfo {
 	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
+	// Last before the runtime field: the fields above keep the offsets older shader journals and
+	// pipeline lists stored.
+	ShaderPixelParameterMode                       parameter_mode = ShaderPixelParameterMode::FirstVertex;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
 };
+
+// Journals and pipeline lists written before async_compute / parameter_mode existed hold padding
+// bytes where those fields now sit (sizeof did not change). Called after a stored input info is
+// copied in: an out-of-range value becomes the default, so it never reaches the translator; the
+// replay's static-key check then skips entries whose stored key does not match.
+inline void ShaderSanitizeStoredInputInfo(ShaderPixelInputInfo& info) {
+	uint8_t mode = 0;
+	std::memcpy(&mode, &info.parameter_mode, 1);
+	if (mode > static_cast<uint8_t>(ShaderPixelParameterMode::Rectangle)) {
+		info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
+	}
+}
+inline void ShaderSanitizeStoredInputInfo(ShaderComputeInputInfo& info) {
+	uint8_t async = 0;
+	std::memcpy(&async, &info.async_compute, 1);
+	info.async_compute = async == 1;
+}
+template <typename InputInfo>
+inline void ShaderSanitizeStoredInputInfo(InputInfo& /*info*/) {}
 
 union ShaderStageInputInfo {
 	const ShaderVertexInputInfo*  vertex;

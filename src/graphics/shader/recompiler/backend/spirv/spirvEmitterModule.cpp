@@ -248,7 +248,12 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 }
 
 void DefineDescriptors(EmitterState& state) {
-	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh) {
+	const bool user_clip_planes = state.program.stage != ShaderType::Pixel &&
+	                              state.program.stage != ShaderType::Compute &&
+	                              state.input_info.vertex != nullptr &&
+	                              state.input_info.vertex->user_clip_planes != 0;
+	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
+	    user_clip_planes) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -311,6 +316,19 @@ void DefineDescriptors(EmitterState& state) {
 						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationCoherent);
 					}
 				}
+				break;
+			}
+			case IR::DescriptorBindingKind::UniformBuffers: {
+				// std430-style dword array (uniformBufferStandardLayout) of the whole binding range.
+				const auto array = state.builder.DecoratedType(
+				    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 4u}}},
+				    TypeU32(state), ConstantU32(state, IR::UniformBufferBytes / 4u));
+				const auto block = state.builder.DecoratedType(
+				    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+				                        {spv::OpDecorate, {spv::DecorationBlock}}},
+				    array);
+				state.uniform_buffer_variable =
+				    Define(ArrayType(block), "uniform_buffers", spv::StorageClassUniform);
 				break;
 			}
 			case IR::DescriptorBindingKind::BdaPagetable:
@@ -568,6 +586,10 @@ void DefineInputs(EmitterState& state) {
 		    })) {
 			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		}
+	} else if (state.program.lane_local || state.split_wave) {
+		// KYTY_LANE_LOCAL: the guest lane of ADD_TID buffers (BufferLane). KYTY_WAVE64_WARPS: the
+		// guest lane (EmitSubgroupLocalInvocationId) and the exchange slot.
+		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 	}
 	for (auto& input: state.inputs) {
 		if (state.program.stage == ShaderType::Pixel &&
@@ -663,7 +685,7 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (state.requirements.subgroup_local_invocation_id) {
+	if (state.requirements.subgroup_local_invocation_id || state.split_wave) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -692,6 +714,21 @@ void DefineOutputs(EmitterState& state) {
 			clip_distance_count = std::max(clip_distance_count, output.index + 1);
 		} else if (output.kind == IR::StageOutputKind::CullDistance) {
 			cull_distance_count = std::max(cull_distance_count, output.index + 1);
+		}
+	}
+	const bool has_position = std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+		return output.kind == IR::StageOutputKind::Position;
+	});
+	if (has_position && state.program.stage != ShaderType::Pixel &&
+	    state.input_info.vertex != nullptr && state.input_info.vertex->user_clip_planes != 0) {
+		// Upstream feed075a9: PipelineCache rejects UCP_ENA with shader clip or cull distances.
+		EXIT_IF(clip_distance_count + cull_distance_count != 0);
+		state.user_clip_planes = state.input_info.vertex->user_clip_planes;
+		for (uint32_t plane = 0; plane < 32u; plane++) {
+			if ((state.user_clip_planes & (1u << plane)) != 0) {
+				state.outputs.push_back(
+				    {{IR::StageOutputKind::ClipDistance, clip_distance_count++, 0, "gl_ClipDistance"}});
+			}
 		}
 	}
 	if (state.program.stage == ShaderType::Mesh) {
@@ -795,6 +832,13 @@ void DefineModule(EmitterState& state) {
 	DefineOutputs(state);
 	DefineTessellationInterfaces(state);
 	DefineDescriptors(state);
+	if (state.split_wave) {
+		// Two alternating halves of one dword per guest lane (ExchangeWaveValue).
+		state.wave_exchange_variable = state.builder.DefineGlobalVariable(
+		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, 128), spv::StorageClassWorkgroup);
+		state.builder.AddName(state.wave_exchange_variable, "wave_exchange");
+		state.wave_exchange_parity = state.builder.AllocateId();
+	}
 	if (state.requirements.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
 	}
@@ -868,15 +912,15 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
-	if (state.lane_count == 2 || state.requirements.subgroup_barrier ||
+	if (state.lane_count == 2 || state.split_wave || state.requirements.subgroup_barrier ||
 	    state.requirements.subgroup_ballot || state.requirements.subgroup_shuffle ||
 	    state.requirements.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
+	if (state.lane_count == 2 || state.split_wave || state.requirements.subgroup_ballot) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
-	if (state.requirements.subgroup_shuffle) {
+	if (state.requirements.subgroup_shuffle || state.split_wave) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
 	}
 	if (state.requirements.subgroup_arithmetic) {

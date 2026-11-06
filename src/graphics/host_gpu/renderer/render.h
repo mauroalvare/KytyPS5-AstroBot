@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/renderer/commandStream.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorSetReuse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -74,6 +75,9 @@ enum class DrawOffsetSource : uint8_t {
 	DrawState,
 	IndirectArgs,
 };
+
+// KYTY_ORDERED_APPEND (renderCompute.cpp).
+[[nodiscard]] bool OrderedAppendSplitEnabled();
 
 struct DrawIndexArgs {
 	uint32_t         index_count                = 0;
@@ -194,6 +198,25 @@ struct DrawAutoArgs {
 // would still hold it (DescriptorSetAudit*; compare DescriptorSetsReused).
 [[nodiscard]] bool DescriptorSetReuseAuditEnabled();
 [[nodiscard]] bool UploadBatchEnabled();
+// KYTY_DISPATCH_OVERLAP (live, default on, needs the batcher): consecutive direct guest dispatches
+// that the guest does not order overlap on the GPU, as on the console. Every dispatch requests, after
+// itself, a dependency from compute shader accesses to everything later (BarrierOrigin::
+// ShaderAccess), and a dispatch with storage writes one from everything earlier to it
+// (ShaderWriteHazard); between two dispatches they merge into one compute -> compute barrier that
+// serialized every dispatch pair. With the switch on, a direct dispatch drops the previous
+// dispatch's still-pending ShaderAccess request and skips its own ShaderWriteHazard when nothing at
+// all happened between the two (CommandBuffer::TakeDispatchOverlap): no command recorded, no other
+// barrier request, layout transition or upload queued, no guest packet other than register writes
+// executed (a draw, any synchronization packet, a label, a flush or a CP read breaks the chain),
+// and neither dispatch uses emulated LDS (one device buffer for every workgroup). The ShaderAccess
+// request of the later dispatch then orders both dispatches (its first scope is every earlier
+// compute shader access) before everything after them, so emulator copies, readbacks, draws and
+// guest-synchronized dispatches see exactly what they saw before. Only the two dispatches lose
+// their ordering against each other, which the guest never requested: its CS_PARTIAL_FLUSH,
+// ACQUIRE_MEM, RELEASE_MEM, EVENT_WRITE and WAIT_REG_MEM still become barriers or end the chain.
+// Indirect dispatches keep their barriers (their argument barrier serializes them anyway).
+// KYTY_DISPATCH_OVERLAP=0 restores the barrier pair between every two dispatches.
+[[nodiscard]] bool DispatchOverlapEnabled();
 
 // Attribution of batched barrier requests (gpuOpProfiler site of the recorded batch).
 enum class BarrierOrigin : uint32_t {
@@ -239,6 +262,10 @@ public:
 	[[nodiscard]] CommandSink Sink() const;
 	[[nodiscard]] CommandSink StateSink() const;
 	[[nodiscard]] CommandSink EmissionSink() const;
+	//  - HelperSink(): Sink() for the cache/tiler/fault/readback helpers that recorded through
+	//    Handle() before (each drained the recorder). KYTY_CP_SINK_ROUTES=0 (live; default 1)
+	//    restores that: the recorder is drained and the sink records natively in the direct window.
+	[[nodiscard]] CommandSink HelperSink() const;
 	// Marks an emission safe point without a sink.
 	void BeginEmission() const { CloseDirectWindow(); }
 	// The native command buffer being recorded, for identity comparisons only (Image::Transit
@@ -271,6 +298,19 @@ public:
 	                       std::span<const vk::BufferCopy> regions) const;
 	// Records the pending batch now (no-op when empty).
 	void FlushBarriers() const;
+	// KYTY_DISPATCH_OVERLAP (see DispatchOverlapEnabled()). After a direct guest dispatch and its
+	// ShaderAccess request: the chain is open while nothing else happens in this command buffer.
+	// lds: the dispatch uses emulated LDS (never overlapped).
+	void NoteGuestDispatch(bool lds) const;
+	// Ends the open chain (the command processor executed a packet other than a register write or
+	// a direct dispatch). Recording any command or flushing the batch ends it too.
+	void BreakDispatchOverlap() const noexcept { m_overlap_open = false; }
+	// At the next direct dispatch, after its bindings were committed and before its own barrier
+	// requests: whether the chain is still open, nothing but the previous dispatch's ShaderAccess
+	// request is pending, and neither dispatch uses emulated LDS. Always closes the chain. When it
+	// returns true and 	ake is set, the pending request was dropped: the caller skips its
+	// ShaderWriteHazard request and keeps its own ShaderAccess request after the dispatch.
+	[[nodiscard]] bool TakeDispatchOverlap(bool lds, bool take) const;
 	// Whether anything is pending, and whether queued upload copies are (RequestUploadCopy).
 	[[nodiscard]] bool HasPendingBarriers() const noexcept { return !m_pending.Empty(); }
 	[[nodiscard]] bool HasPendingUploads() const noexcept { return !m_pending.uploads.empty(); }
@@ -411,6 +451,7 @@ private:
 	void NoteForeignCommand() const {
 		m_recorded_since_flush = true;
 		m_epoch_clean          = false;
+		m_overlap_open         = false;
 	}
 	[[nodiscard]] bool CanSinkPending() const;
 	[[nodiscard]] bool CanSinkDrawWrites() const;
@@ -472,6 +513,9 @@ private:
 	mutable bool     m_draw_safe          = false;
 	// NoteFeedbackKeep() since the last BeginRendering() (at most one depth attachment per draw).
 	mutable std::optional<vk::ImageMemoryBarrier2> m_feedback_keep;
+	// KYTY_DISPATCH_OVERLAP: NoteGuestDispatch() since anything else happened (TakeDispatchOverlap).
+	mutable bool m_overlap_open = false;
+	mutable bool m_overlap_lds  = false;
 
 	// KYTY_CP_RECORDER: the scheduler's recorder and its encoder (null when off), and whether a
 	// direct window is open (the CP records natively after a drain; see Sink()).
@@ -572,6 +616,23 @@ public:
 			m_owner->m_encoder->fillBuffer(buffer, offset, size, value);
 		} else {
 			m_owner->m_buffer.fillBuffer(buffer, offset, size, value);
+		}
+	}
+	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue* color,
+	                     uint32_t count, const vk::ImageSubresourceRange* ranges) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->clearColorImage(image, layout, color, count, ranges);
+		} else {
+			m_owner->m_buffer.clearColorImage(image, layout, color, count, ranges);
+		}
+	}
+	void clearDepthStencilImage(vk::Image image, vk::ImageLayout layout,
+	                            const vk::ClearDepthStencilValue* value, uint32_t count,
+	                            const vk::ImageSubresourceRange* ranges) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->clearDepthStencilImage(image, layout, value, count, ranges);
+		} else {
+			m_owner->m_buffer.clearDepthStencilImage(image, layout, value, count, ranges);
 		}
 	}
 	void bindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) const {
@@ -863,6 +924,14 @@ public:
 			m_owner->m_buffer.dispatch(x, y, z);
 		}
 	}
+	void dispatchBase(uint32_t bx, uint32_t by, uint32_t bz, uint32_t x, uint32_t y,
+	                  uint32_t z) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->dispatchBase(bx, by, bz, x, y, z);
+		} else {
+			m_owner->m_buffer.dispatchBase(bx, by, bz, x, y, z);
+		}
+	}
 	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
 		if (m_owner->Encoding()) {
 			m_owner->m_encoder->dispatchIndirect(buffer, offset);
@@ -917,6 +986,17 @@ public:
 			m_owner->m_buffer.writeBufferMarkerAMD(stage, buffer, offset, marker);
 		}
 	}
+	// KYTY_STREAM_COPY_DEFER: encodes a host copy of guest bytes for the recorder thread (in stream
+	// order, before the next Submit). False (nothing encoded) outside recorder encoding (recorder
+	// off or a direct window open): the caller then copies itself. Not a command: construct the
+	// sink directly (CommandSink(buffer)); Sink() would also flush the barrier batch.
+	[[nodiscard]] bool hostCopy(void* destination, uint64_t source, uint64_t size) const {
+		if (!m_owner->Encoding()) {
+			return false;
+		}
+		m_owner->m_encoder->hostCopy(destination, source, size);
+		return true;
+	}
 
 private:
 	const CommandBuffer* m_owner;
@@ -962,6 +1042,10 @@ struct GraphicsDynamicStateShadow {
 	std::array<float, 2> depth_bounds {};
 };
 
+// KYTY_REBIND_AFTER_JOIN (descriptors.cpp).
+[[nodiscard]] bool RebindAfterJoinEnabled();
+void               NoteRebindAfterJoin(const char* kind, const char* name);
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context);
@@ -969,9 +1053,10 @@ public:
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                    bool async_compute = false);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
-	                      uint32_t mode);
+	                      uint32_t mode, bool async_compute = false);
 
 	// plan: the committed draw's binding plan for this stage (KYTY_DRAW_PREP_BINDINGS), or null.
 	// keep_images (KYTY_DRAW_RUN continuation): the stage's texture and sampler bindings are the
@@ -1064,6 +1149,8 @@ private:
 	                              bool ignore_target_mask = false, bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
+	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                   const DrawEmitInfo& emit, DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
@@ -1097,8 +1184,10 @@ private:
 	// fresh: the writes refer to an upload made for this command (KYTY_SET_REUSE_FRESH).
 	void CommitDescriptorSet(CommandBuffer& buffer, vk::PipelineBindPoint point,
 	                         const PipelineCache::Pipeline& pipeline, bool fresh);
-	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-	                                                     const CommandBuffer&          buffer);
+	// Records the metadata clears a dispatch's buffer writes establish; whether it recorded one
+	// (renderCompute.cpp, KYTY_COMPUTE_META_CLEAR_DISPATCH).
+	bool                      UpdateComputeMetaClears(const ShaderComputeInputInfo& input,
+	                                                  const CommandBuffer&          buffer);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
@@ -1279,6 +1368,8 @@ private:
 	struct DrawRunRecord {
 		bool              valid            = false;
 		uint64_t          key              = 0;
+		uint64_t          targets_key      = 0; // KYTY_DRAW_RUN_TARGETS
+		uint64_t          swap_key         = 0; // KYTY_DRAW_RUN_PIPESWAP
 		uint64_t          activity         = 0;
 		vk::CommandBuffer command          = nullptr;
 		uint64_t          tick             = 0;
@@ -1402,11 +1493,57 @@ private:
 	bool                         m_run_keepable  = false;
 	bool          m_run_prev_valid     = false; // m_run.valid when the committed draw began
 	bool          m_run_active         = false; // the draw takes the delta path
+	uint64_t      m_rebind_epoch       = 0;     // KYTY_REBIND_AFTER_JOIN: UnregisterEpoch at resolution
 	bool          m_run_verify         = false; // verify mode: the draw would have continued
 	uint64_t      m_run_key            = 0;     // the committed draw's structure key (the engine)
+	uint64_t      m_run_targets_key    = 0;     // and its registers' part (KYTY_DRAW_RUN_TARGETS)
+	uint64_t      m_run_swap_key       = 0;     // and the key without the vertex program (PIPESWAP)
+	bool          m_run_pipeswap       = false; // KYTY_DRAW_RUN_PIPESWAP: the continuation swaps
+	// KYTY_DRAW_RUN_PIPESWAP: the kept vertex-stage bindings and claims fit the new vertex program.
+	[[nodiscard]] static bool DrawRunPipeSwapCompatible(
+	    const ShaderRecompiler::IR::CompiledShaderInfo& recorded,
+	    const ShaderRecompiler::IR::CompiledShaderInfo& program);
+	bool          m_run_targets_kept   = false; // KYTY_DRAW_RUN_TARGETS: the draw kept the record's
+	// KYTY_DRAW_RUN_TARGETS: whether the committed draw may keep the record's resolved targets.
+	[[nodiscard]] bool DrawRunTargetsCandidate(const CommandBuffer& buffer, const DrawRenderState& state,
+	                                           uint32_t render_target_slice_offset) const;
+	// KYTY_DRAW_RUN_KEY_DIAG (drawRun.h): the committed draw's key parts (the engine; null when off)
+	// and the diagnostic's state (GPU thread).
+	const DrawRun::KeyParts* m_run_parts = nullptr;
+	struct DrawRunKeyDiagState {
+		struct Recent {
+			uint64_t          key      = 0;
+			uint64_t          activity = 0;
+			vk::CommandBuffer command  = nullptr;
+			uint64_t          tick     = 0;
+			uint64_t          serial   = 0;
+		};
+		DrawRun::KeyParts               record_parts {}; // m_run's
+		bool                            record_parts_valid = false;
+		uint64_t                        record_pipeline    = 0; // m_run's resolved pipeline
+		uint64_t                        record_structure   = 0; // and structure
+		bool                            record_resolved    = false;
+		uint64_t                        last_key           = 0; // the previous committed draw's
+		DrawRun::KeyDiag::Inelig        reason      = DrawRun::KeyDiag::Inelig::NotReached; // this draw's
+		DrawRun::KeyDiag::Inelig        prev_reason = DrawRun::KeyDiag::Inelig::NotReached;
+		int                             combo       = -2; // this draw's key-difference combination
+		std::array<Recent, 16>          recent {};
+		uint32_t                        recent_next = 0;
+	};
+	DrawRunKeyDiagState m_key_diag;
+	// KYTY_DRAW_RUN_KEY_DIAG: the draw resolved its structure (eligibility check point).
+	void DrawRunKeyDiagResolved(const CommandBuffer& buffer, std::span<PreparedBindings* const> stages,
+	                            const PipelineCache::Pipeline& pipeline, const RenderState& rendering,
+	                            bool recorded);
 	bool          m_in_engine_commit   = false;
 	bool          m_prepared_validated = false; // RefreshShaders accepted the draw's preparation
 	uint32_t      m_run_slice_offset   = 0;
+	// KYTY_MRT_SPLIT (renderDraw.cpp AliasedColorSlots): the colour slots this pass of a draw may bind
+	// (~0: all), whether the draw may split (DrawIndex, DrawAuto), and the slots its first pass left
+	// out for a second pass.
+	uint32_t      m_mrt_filter         = ~0u;
+	bool          m_mrt_split_allowed  = false;
+	uint32_t      m_mrt_split_slots    = 0;
 
 	friend class CommandProcessor;
 	friend class DrawPrep::Engine;

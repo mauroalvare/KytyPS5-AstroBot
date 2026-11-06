@@ -8,6 +8,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "loader/guestInstructionPatcher.h"
+#include "loader/jit.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
@@ -110,6 +111,18 @@ constexpr int      ErrorAccess                   = Libs::LibKernel::KERNEL_ERROR
 struct TestFailure {};
 
 int g_failed_tests = 0;
+
+struct GpuRangeEvent {
+	bool mapped;
+	uint64_t address;
+	size_t size;
+	bool operator==(const GpuRangeEvent&) const = default;
+};
+std::vector<GpuRangeEvent> g_gpu_range_events;
+
+void ObserveGpuRange(bool mapped, uint64_t address, size_t size) {
+	g_gpu_range_events.push_back({mapped, address, size});
+}
 
 [[noreturn]] void Fail(const char* test, const std::string& message) {
 	std::fflush(stdout);
@@ -922,7 +935,8 @@ void TestConcurrentBackingReads() {
 	// TryReadSparseBacking's reads are TestTryReadSparseBacking's (the store-level read).
 	for (const auto& readers: {std::pair {&TryReadBacking, &TryReadBacking},
 	                           std::pair {&TryReadBacking, &TestTryReadSparseBacking},
-	                           std::pair {&TestTryReadSparseBacking, &TestTryReadSparseBacking}}) {
+	                           std::pair {&TestTryReadSparseBacking, &TestTryReadSparseBacking},
+	                           std::pair {&CopySparseMemory, &CopySparseMemory}}) {
 		const auto base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
 		                                   "concurrent_backing_reads");
 		std::memcpy(reinterpret_cast<void*>(base), &original, sizeof(original));
@@ -957,7 +971,7 @@ void TestBackingReadExcludesWritesAndUnmap() {
 	const char*        test        = "BackingReadExcludesWritesAndUnmap";
 	constexpr uint64_t original    = 0x123456789abcdef0ull;
 	constexpr uint64_t replacement = 0xfedcba9876543210ull;
-	for (const auto read: {&TryReadBacking, &TestTryReadSparseBacking}) {
+	for (const auto read: {&TryReadBacking, &TestTryReadSparseBacking, &CopySparseMemory}) {
 		for (const bool unmap: {false, true}) {
 			const auto base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
 			                                   "backing_read_exclusion");
@@ -1455,6 +1469,54 @@ void TestRuntimeMemoryOwnerLifecycle() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestCopySparseMemoryMappings() {
+	using namespace Libs::LibKernel::Memory;
+	const char* test = "CopySparseMemoryMappings";
+	constexpr uint64_t size = SceKernelPageSize * 5;
+	const auto base = AllocateRuntimeMemory(0, size, Common::VirtualMemory::Mode::ReadWrite,
+	                                        "sparse_copy_private");
+	Check(test, base != 0, "private allocation failed");
+	for (const auto page : {0u, 2u, 4u}) {
+		Check(test, FreeGuestMemory(base + page * SceKernelPageSize, SceKernelPageSize),
+		      "private page release failed");
+	}
+	void* shared = reinterpret_cast<void*>(base);
+	CheckOk(test, KernelMapNamedFlexibleMemory(&shared, SceKernelPageSize, SceKernelProtCpuRw,
+	                                           SceKernelMapFixed, "sparse_copy_shared"),
+	        "map shared first page");
+	constexpr std::array<uint8_t, 5> values {0x3c, 0xa7, 0, 0x5d, 0};
+	for (const auto page : {0u, 1u, 3u}) {
+		std::memset(reinterpret_cast<void*>(base + page * SceKernelPageSize), values[page],
+		            SceKernelPageSize);
+	}
+	CheckOk(test, KernelMprotect(shared, SceKernelPageSize, 0), "protect shared first page");
+	constexpr uint64_t prefix = 29, suffix = 17, copied = size - prefix - suffix;
+	std::vector<uint8_t> bytes(copied + 2, 0x55);
+	Check(test, !TryReadSparseBacking(base + prefix, bytes.data() + 1, copied) &&
+	                std::all_of(bytes.begin(), bytes.end(), [](uint8_t value) { return value == 0x55; }),
+	      "strict backing read accepted private memory or changed its destination");
+	Check(test, CopySparseMemory(base + prefix, bytes.data() + 1, copied),
+	      "sparse copy rejected mixed shared, private and unbacked pages");
+	Check(test, bytes.front() == 0x55 && bytes.back() == 0x55,
+	      "sparse copy overwrote destination canaries");
+	for (uint64_t i = 0; i < copied; ++i) {
+		Check(test, bytes[i + 1] == values[(prefix + i) / SceKernelPageSize],
+		      "sparse copy misplaced mapped data or an unbacked gap");
+	}
+	uint64_t canary = UINT64_MAX;
+	Check(test, !CopySparseMemory(0x10000, &canary, sizeof(canary)) &&
+	                !CopySparseMemory(UINT64_MAX - 3, &canary, sizeof(canary)) &&
+	                !CopySparseMemory(base, &canary, 0) &&
+	                !CopySparseMemory(base, nullptr, sizeof(canary)) && canary == UINT64_MAX,
+	      "invalid sparse copy accepted its range or changed its destination");
+	CheckOk(test, KernelMunmap(base, SceKernelPageSize), "unmap shared first page");
+	for (const auto page : {1u, 3u}) {
+		Check(test, FreeGuestMemory(base + page * SceKernelPageSize, SceKernelPageSize),
+		      "private page cleanup failed");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFlexibleMapQueryAndWholeMunmap() {
 	const char* test     = "FlexibleMapQueryAndWholeMunmap";
 	const auto  baseline = AvailableFlexibleMemory(test);
@@ -1651,20 +1713,23 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	ExpectUnmapped(test, base + SceKernelPageSize);
 
 	constexpr uint64_t transaction_sentinel = 0x5452414e53414354ull; // "TRANSACT"
-	constexpr uint64_t rejected_write       = 0x4e4f504152544941ull; // "NOPARTIA"
+	constexpr uint64_t sparse_write         = 0x4e4f504152544941ull; // "NOPARTIA"
+	constexpr uint64_t backed_prefix_mask   = 0xffffffffull;
 	const auto         crossing_address     = base + SceKernelPageSize - sizeof(uint32_t);
 	std::memcpy(reinterpret_cast<void*>(alias_base + SceKernelPageSize - sizeof(uint32_t)),
 	            &transaction_sentinel, sizeof(transaction_sentinel));
 	Check(test,
-	      !Libs::LibKernel::Memory::TryWriteBacking(crossing_address, &rejected_write,
-	                                                sizeof(rejected_write)),
-	      "TryWriteBacking should reject a range crossing an unmapped span");
-	uint64_t backing_after_rejected_write = 0;
-	std::memcpy(&backing_after_rejected_write,
+	      Libs::LibKernel::Memory::TryWriteBacking(crossing_address, &sparse_write,
+	                                               sizeof(sparse_write)),
+	      "TryWriteBacking should write a range crossing an unmapped span");
+	uint64_t backing_after_sparse_write = 0;
+	std::memcpy(&backing_after_sparse_write,
 	            reinterpret_cast<const void*>(alias_base + SceKernelPageSize - sizeof(uint32_t)),
-	            sizeof(backing_after_rejected_write));
-	Check(test, backing_after_rejected_write == transaction_sentinel,
-	      "failed backing writes must not modify a validated prefix");
+	            sizeof(backing_after_sparse_write));
+	Check(test,
+	      backing_after_sparse_write == ((sparse_write & backed_prefix_mask) |
+	                                     (transaction_sentinel & ~backed_prefix_mask)),
+	      "sparse backing writes must fill the backed prefix and skip the unmapped span");
 	uint64_t rejected_read = transaction_sentinel;
 	Check(test,
 	      !Libs::LibKernel::Memory::TryReadBacking(crossing_address, &rejected_read,
@@ -3073,6 +3138,58 @@ void TestLargeHintedReserveHostsSmallDirectMap() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// Upstream 259a40abf, adapted: this line has no automatic AMM backing (MapAutomaticMemory), so
+// the AMM unmap is checked on an ordinary direct mapping: holes are accepted, and an owner failure
+// restores exactly the GPU range it had unmapped.
+void TestAmmUnmapAcceptsHolesAndRestoresGpuRange() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "AmmUnmapAcceptsHolesAndRestoresGpuRange";
+	constexpr uint64_t page     = SceKernelPageSize;
+	constexpr uint64_t sentinel = 0x0123456789abcdefull;
+	int64_t            phys     = 0;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(SceKernelDirectMemoryStart, KernelGetDirectMemorySize(),
+	                                   page * 4, page, SceKernelMtypeC, &phys),
+	        "KernelAllocateDirectMemory");
+	void* addr = nullptr;
+	CheckOk(test,
+	        KernelMapNamedDirectMemory(&addr, page * 4, SceKernelProtCpuRw, 0, phys, page,
+	                                   "amm_unmap_holes"),
+	        "KernelMapNamedDirectMemory");
+	const auto base = reinterpret_cast<uint64_t>(addr);
+	CheckOk(test, KernelMunmap(base, page), "KernelMunmap(first page)");
+	CheckOk(test, KernelMunmap(base + page * 3, page), "KernelMunmap(last page)");
+	Check(test, KernelMunmap(base, page * 4) == ErrorAccess,
+	      "kernel unmap unexpectedly accepted a range with holes");
+	for (const auto [address, size]: {std::pair {base + 1, page}, {base, page - 1}, {base, 0}}) {
+		Check(test, UnmapAmmMemory(address, size) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+		      "AMM unmap accepted an unaligned or empty range");
+	}
+	*reinterpret_cast<uint64_t*>(base + page) = sentinel;
+
+	TestFailPhysicalMemoryUnmapAfter(0);
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	const int unmap_result = UnmapAmmMemory(base, page * 4);
+	TestSetGpuRangeCallback(nullptr);
+	TestFailPhysicalMemoryUnmapAfter(UINT32_MAX);
+	CheckFailed(test, unmap_result, "AMM unmap owner failure");
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {{false, base + page, page * 2},
+	                                      {true, base + page, page * 2}},
+	      "failed AMM unmap did not restore exactly the surviving GPU range");
+	Check(test, *reinterpret_cast<const uint64_t*>(base + page) == sentinel,
+	      "failed AMM unmap did not restore the original backing");
+
+	CheckOk(test, UnmapAmmMemory(base, page * 4), "AMM unmap with leading and trailing holes");
+	ExpectUnmapped(test, base + page);
+	ExpectUnmapped(test, base + page * 2);
+	CheckOk(test, UnmapAmmMemory(base, page * 4), "AMM unmap of a completely unmapped range");
+	CheckOk(test, KernelReleaseDirectMemory(phys, page * 4), "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestMemoryPoolAlignmentContracts() {
 	const char* test = "MemoryPoolAlignmentContracts";
 	void*       addr = nullptr;
@@ -4229,13 +4346,14 @@ void TestPackedBitField(bool insert) {
 						const auto mxcsr = _mm_getcsr();
 						_mm_setcsr(restore.mxcsr);
 						++calls;
+						// Match AMD's zeroed XMM upper quadword, while preserving YMM bits 255:128.
 						Check(test,
 						      output.destination[0] ==
 						              (insert ? insert_bits(input[0],
 						                                    input[source == destination ? 0 : 4],
 						                                    length, index)
 						                      : extract(input[0], length, index)) &&
-						          output.destination[1] == (insert ? input[1] : 0) &&
+						          output.destination[1] == 0 &&
 						          output.destination[2] == input[2] &&
 						          output.destination[3] == input[3],
 						      "SSE4a bitfield result or destination lanes differ");
@@ -4740,9 +4858,10 @@ void TestCpuExtensionPatches() {
 			__rdtscp(&after);
 			Check(test, g_instruction_traps == traps + !host.sse4a + !host.rdpid,
 			      "mixed CPU extension fixture used an unexpected trap path");
+			// The trap emulator matches AMD's zeroed bits 127:64, not the old sentinel.
 			Check(test,
 			      output[1] == 0x123456789abcdef0ull && output[2] == 0x1ab1 &&
-			          (host.sse4a || output[3] == input[1]) &&
+			          (host.sse4a || output[3] == 0) &&
 			          std::equal(output.begin() + 4, output.end(), input.begin() + 2),
 			      "mixed CPU extensions corrupted INSERTQ state or the guest red zone");
 			if (before == after) {
@@ -4946,12 +5065,66 @@ void TestSmallFiberStacksAndMigration() {
 
 } // namespace
 
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+KYTY_MS_ABI uint8_t* TlsStubTestAddress() {
+	return reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(0x123456789abcull));
+}
+
+void TestTlsStubsPreserveFlags() {
+	const char*    test      = "TlsStubsPreserveFlags";
+	const uint64_t stub_size = Loader::Jit::SafeCall::GetSize();
+	constexpr uint64_t CODE_SIZE = 0x1000;
+	constexpr uint8_t  REG       = 1;
+	const auto         mapping   = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x0000000906000000ull, stub_size + CODE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
+	    "tls_stub_test");
+	Check(test, mapping != 0, "failed to allocate TLS stub test code");
+	auto* safe_call = new (reinterpret_cast<void*>(mapping)) Loader::Jit::SafeCall;
+	safe_call->SetFunc(TlsStubTestAddress);
+	const auto stub_address = mapping + Loader::Jit::TlsRegStub::GetOffset(REG);
+	auto*      stub         = new (reinterpret_cast<void*>(stub_address)) Loader::Jit::TlsRegStub;
+	stub->SetFunc(mapping);
+	stub->SetOutputReg(REG);
+
+	using Fixture  = uint64_t(KYTY_SYSV_ABI*)(uint64_t*);
+	bool preserved = true;
+	for (const auto [input, status]: {std::pair {uint8_t {0x7f}, uint64_t {0x890}},
+	                                  std::pair {uint8_t {0xff}, uint64_t {0x055}}}) {
+		Xbyak::CodeGenerator code(CODE_SIZE, reinterpret_cast<void*>(mapping + stub_size));
+		code.push(code.rbx);
+		code.mov(code.rbx, code.rdi);
+		code.mov(code.rax, 0x5555555555555555ull);
+		code.mov(code.al, input);
+		code.add(code.al, 1);
+		code.mov(code.r11, stub_address);
+		code.call(code.r11);
+		code.mov(code.qword[code.rbx], code.rcx);
+		code.mov(code.qword[code.rbx + 8], code.rax);
+		code.pushf();
+		code.pop(code.rax);
+		code.pop(code.rbx);
+		code.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate TLS stub fixture");
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, stub_size + CODE_SIZE),
+		      "failed to flush TLS stub test code");
+		std::array<uint64_t, 2> registers {};
+		const auto flags = reinterpret_cast<Fixture>(mapping + stub_size)(registers.data());
+		const auto rax   = (0x5555555555555555ull & ~0xffull) | static_cast<uint8_t>(input + 1u);
+		preserved &= (flags & 0x8d5u) == status && registers[0] == 0x123456789abcull &&
+		             registers[1] == rax;
+	}
+	Libs::LibKernel::Memory::FreeGuestMemory(mapping, stub_size + CODE_SIZE);
+	Check(test, preserved, "TLS stubs changed the caller's flags or registers");
+}
+#endif
+
 int main(int argc, char** argv) {
 	InitSubsystems();
 	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
 		RunTest(TestConcurrentBackingReads);
 		RunTest(TestBackingReadExcludesWritesAndUnmap);
 		RunTest(TestSparseBackingReadPreservesResidency);
+		RunTest(TestCopySparseMemoryMappings);
 		RunTest(TestSparseReadDuringDirectCommit);
 		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 		RunTest(TestFlexibleMemoryUsesSharedBacking);
@@ -5021,6 +5194,7 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestSparseBackingReadPreservesResidency);
 	RunTest(TestBackingInPlaceInspection);
+	RunTest(TestCopySparseMemoryMappings);
 	RunTest(TestSparseReadDuringDirectCommit);
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadExcludesWritesAndUnmap);
@@ -5045,6 +5219,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestClampRangeMemoFollowsMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
+	RunTest(TestAmmUnmapAcceptsHolesAndRestoresGpuRange);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 #if defined(__linux__)
 	RunTest(TestPartialUnmapPreservesHostPermissions);
@@ -5082,6 +5257,9 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestTlsStubsPreserveFlags);
+#endif
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

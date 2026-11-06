@@ -5,6 +5,7 @@
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
 #include "common/liveSwitch.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
@@ -612,7 +613,7 @@ void CommandScheduler::CheckActive() const {
 }
 
 CommandBuffer& CommandScheduler::Current() {
-	CheckActive();
+	EXIT_IF(m_command.IsInvalid());
 	return m_command;
 }
 
@@ -620,6 +621,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	m_dynamic_state.Invalidate();
 	if (m_recorder != nullptr) {
 		// The recorder begins the native buffer and stamps KYTY_GPU_TIMING / GpuOpProfiler there,
 		// with this recording's tick and start time.
@@ -683,6 +685,16 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 			} else {
 				dependency->WaitHost(value);
 			}
+		}
+	}
+	// KYTY_TEXTURE_SPARSE_RESIDENCY: memory bound behind image levels on the side queue
+	// (GraphicContext::BindSparseImageLevels, already submitted) before this batch uses it.
+	if (const auto sparse = m_graphics.SparseBindPendingValue(); sparse != 0) {
+		if (submit.num_wait_semaphores < SubmitInfo::MaxSemaphores) {
+			submit.AddWait(m_graphics.SparseBindSemaphore(), sparse,
+			               vk::PipelineStageFlagBits::eAllCommands);
+		} else {
+			m_graphics.WaitSparseBinds(); // no free wait slot: the binds are done before submission
 		}
 	}
 	const auto count_boundary = [this, &submit, force_completion] {
@@ -827,6 +839,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 			result = graphics.queue.submit(1, &submit_info, nullptr);
 		}
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result == vk::Result::eErrorDeviceLost) {
 		DumpDeviceLossDiagnostics(graphics, tick);

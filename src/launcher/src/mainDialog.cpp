@@ -4,13 +4,15 @@
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
-#include "controllerLightbar.h"
+#include "controllerPreview.h"
 #include "gameContent.h"
+#include "titleSound.h"
 #include "updateChecker.h"
 
 #include <QApplication>
 #include <QByteArray>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDialog>
 #include <QDir>
 #include <QFile>
@@ -25,6 +27,7 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QStringList>
+#include <QStyleHints>
 #include <QTextStream>
 #include <QVariant>
 #include <QtCore>
@@ -60,7 +63,8 @@ constexpr DWORD CMD_Y_CHARS = 1000;
 #endif
 constexpr char SETTINGS_MAIN_DIALOG[]        = "MainDialog";
 constexpr char SETTINGS_MAIN_LAST_GEOMETRY[] = "geometry";
-constexpr char SETTINGS_CHECK_UPDATES[]       = "check_updates_on_startup";
+constexpr char SETTINGS_CHECK_UPDATES[]      = "check_updates_on_startup";
+constexpr char SETTINGS_THEME[]              = "theme";
 
 class MainDialogPrivate: public QObject {
 	Q_OBJECT
@@ -86,11 +90,23 @@ public:
 private:
 	static QByteArray g_last_geometry;
 	static bool       g_check_updates_on_startup;
+	static int        g_theme;
+
+	static void ApplyTheme(int theme) {
+		auto scheme = Qt::ColorScheme::Unknown;
+		switch (theme) {
+			case 1: scheme = Qt::ColorScheme::Dark; break;
+			case 2: scheme = Qt::ColorScheme::Light; break;
+			default: break;
+		}
+		QApplication::styleHints()->setColorScheme(scheme);
+	}
 
 	Ui::MainDialog* m_ui             = {nullptr};
 	MainDialog*     m_main_dialog    = nullptr;
 	UpdateChecker*  m_update_checker = nullptr;
-	ControllerLightbar m_lightbar;
+	ControllerPreview m_controller_preview;
+	TitleSound      m_title_sound;
 	QString         m_interpreter;
 	QString         m_preset_warning;
 	QLabel*         m_preset_label   = nullptr;
@@ -103,6 +119,7 @@ private:
 
 QByteArray MainDialogPrivate::g_last_geometry;
 bool       MainDialogPrivate::g_check_updates_on_startup = true;
+int        MainDialogPrivate::g_theme                    = 0;
 
 MainDialog::MainDialog(QWidget* parent): QDialog(parent), m_p(new MainDialogPrivate(this)) {
 	m_p->Setup(this);
@@ -116,10 +133,13 @@ MainDialogPrivate::~MainDialogPrivate() {
 void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui = new Ui::MainDialog;
 	m_ui->setupUi(main_dialog);
+	m_ui->widget->SetControllerPreview(&m_controller_preview);
 
 	m_main_dialog = main_dialog;
 	m_update_checker = new UpdateChecker(main_dialog);
 	m_ui->check_updates_on_startup->setChecked(g_check_updates_on_startup);
+	m_ui->theme_combo->setCurrentIndex(g_theme);
+	ApplyTheme(g_theme);
 	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
 	m_ui->check_updates_on_startup->setVisible(UpdateChecker::IsSupported());
 
@@ -127,11 +147,17 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);
-	connect(m_ui->widget, &ConfigurationListWidget::Select, this, &MainDialogPrivate::Update);
+	connect(m_ui->widget, &ConfigurationListWidget::Select, this, [this]() {
+		Update();
+		const auto* item = m_ui->widget->GetSelectedItem();
+		m_title_sound.SetTitle(m_process.state() == QProcess::NotRunning && item != nullptr
+		                           ? item->GetInfo().basedir
+		                           : QString());
+	});
 	connect(m_ui->widget, &ConfigurationListWidget::PreviewControllerColor, this,
 	        [this](const QString& color) {
 		        if (m_process.state() == QProcess::NotRunning) {
-			        m_lightbar.SetColor(color);
+			        m_controller_preview.SetColor(color);
 		        }
 	        });
 	connect(m_ui->widget, &ConfigurationListWidget::Run, this, &MainDialogPrivate::Run);
@@ -139,8 +165,14 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	        [this](const QString&) { m_update_checker->Check(true); });
 	connect(m_update_checker, &UpdateChecker::CheckingChanged, m_ui->check_updates_link,
 	        &QLabel::setDisabled);
+	connect(m_update_checker, &UpdateChecker::InstallingChanged, this, &MainDialogPrivate::Update);
 	connect(m_ui->check_updates_on_startup, &QCheckBox::toggled, this, [this](bool checked) {
 		g_check_updates_on_startup = checked;
+		m_ui->widget->WriteSettings();
+	});
+	connect(m_ui->theme_combo, &QComboBox::currentIndexChanged, this, [this](int index) {
+		g_theme = index;
+		ApplyTheme(index);
 		m_ui->widget->WriteSettings();
 	});
 	connect(main_dialog, &MainDialog::Resize, [this]() {
@@ -149,6 +181,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	});
 
 	connect(&m_process, &QProcess::stateChanged, this, [this](QProcess::ProcessState state) {
+		m_update_checker->SetGameRunning(state != QProcess::NotRunning);
 		if (state == QProcess::NotRunning) {
 			if (m_running_item != nullptr) {
 				m_running_item->SetRunning(false);
@@ -165,6 +198,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 }
 
 void MainDialogPrivate::FindInterpreter() {
+	UpdateChecker::ShowPreviousResult(m_main_dialog);
 	QDir search_dir(QApplication::applicationDirPath());
 	m_interpreter = search_dir.absoluteFilePath(EMULATOR_EXE);
 
@@ -243,6 +277,12 @@ static QString BoolArg(bool value) {
 	return value ? QStringLiteral("true") : QStringLiteral("false");
 }
 
+static void AddFlag(QStringList& args, bool enabled, const char* name) {
+	if (enabled) {
+		args << name;
+	}
+}
+
 static QStringList CreateEmulatorArgs(const Configuration& info) {
 	QStringList args;
 	auto        r = EnumToText(info.screen_resolution).split('x');
@@ -273,23 +313,23 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		// Overrides the bundled preset's KYTY_GPU_OCCLUSION (performance mode by default).
 		args << "--gpu-occlusion" << "on";
 	}
+	args << "--keyboard-player" << QString::number(info.controller.keyboard_player);
 	args << "--present-mode" << EnumToText(info.present_mode);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
 	}
-	if (info.fullscreen_enabled) {
-		args << "--fullscreen";
-	}
-	if (info.hide_cursor_enabled) {
-		args << "--hide-cursor";
-	}
+	AddFlag(args, info.fullscreen_enabled, "--fullscreen");
+	AddFlag(args, info.hdr_enabled, "--hdr");
+	AddFlag(args, info.hide_cursor_enabled, "--hide-cursor");
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
+	args << "--readback-tiled-images" << BoolArg(info.readback_tiled_images);
 	args << "--sync-raw-image-buffers" << BoolArg(info.sync_raw_image_buffers);
 	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
+	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
+	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
 	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
-	if (info.tessellation_enabled) {
-		args << "--tessellation";
-	}
+	args << "--network-connected" << BoolArg(info.network_connected);
+	AddFlag(args, info.tessellation_enabled, "--tessellation");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
@@ -315,22 +355,21 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--no-amd-cpu";
 	}
 #if defined(_WIN32)
-	if (info.red_zone_protection_enabled) {
-		args << "--redzone";
-	}
+	AddFlag(args, info.red_zone_protection_enabled, "--redzone");
 #endif
 	for (const auto& binding: info.host_input_mapping) {
 		args << "--keymap" << binding;
 	}
-	if (info.renderdoc_enabled) {
-		args << "--rd";
-	}
+	AddFlag(args, info.renderdoc_enabled, "--rd");
 
 	QString game = info.basedir;
 	if (!info.elf.isEmpty() && !GameContent::IsArchive(info.basedir)) {
 		game = QDir(info.basedir).filePath(info.elf);
 	}
 	args << "--game" << game;
+	if (!info.addons_dir.isEmpty()) {
+		args << "--addcont-dir" << info.addons_dir;
+	}
 
 	const auto patch_plan = Cheats::PlanPath(info.title_id);
 	if (QFileInfo::exists(patch_plan)) {
@@ -539,6 +578,7 @@ void MainDialogPrivate::WriteSettings(QSettings& s) {
 		s.setValue(SETTINGS_MAIN_LAST_GEOMETRY, g_last_geometry);
 	}
 	s.setValue(SETTINGS_CHECK_UPDATES, g_check_updates_on_startup);
+	s.setValue(SETTINGS_THEME, g_theme);
 
 	s.endGroup();
 }
@@ -548,18 +588,26 @@ void MainDialogPrivate::ReadSettings(QSettings& s) {
 
 	g_last_geometry = s.value(SETTINGS_MAIN_LAST_GEOMETRY, g_last_geometry).toByteArray();
 	g_check_updates_on_startup = s.value(SETTINGS_CHECK_UPDATES, true).toBool();
+	g_theme                    = s.value(SETTINGS_THEME, 0).toInt();
+	if (g_theme < 0 || g_theme > 2) {
+		g_theme = 0;
+	}
 
 	s.endGroup();
 }
 
 void MainDialogPrivate::Run() {
+	if (m_update_checker->IsInstalling()) {
+		return;
+	}
 	m_running_item = m_ui->widget->GetSelectedItem();
 	if (m_running_item == nullptr) {
 		return;
 	}
 
 	m_running_item->SetRunning(true);
-	m_lightbar.Stop();
+	m_controller_preview.SetSuspended(true);
+	m_title_sound.SetTitle({});
 
 	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
 	m_main_dialog->RunInterpreter(&m_process, *info);
@@ -570,7 +618,8 @@ void MainDialogPrivate::Run() {
 void MainDialogPrivate::Update() {
 	const auto* item = m_ui->widget->GetSelectedItem();
 
-	bool run_enabled = (m_process.state() == QProcess::NotRunning && item != nullptr);
+	bool run_enabled = (m_process.state() == QProcess::NotRunning && item != nullptr &&
+	                    !m_update_checker->IsInstalling());
 
 	if (run_enabled) {
 		const auto& info = item->GetInfo();
@@ -580,10 +629,11 @@ void MainDialogPrivate::Update() {
 
 	m_ui->widget->SetRunEnabled(run_enabled);
 	if (m_process.state() != QProcess::NotRunning) {
-		m_lightbar.Stop();
+		m_controller_preview.SetSuspended(true);
 		return;
 	}
-	m_lightbar.SetColor(m_ui->widget->GetGlobalControllerColor());
+	m_controller_preview.SetSuspended(false);
+	m_controller_preview.SetColor(m_ui->widget->GetGlobalControllerColor());
 }
 
 #include "mainDialog.moc"

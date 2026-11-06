@@ -10,7 +10,9 @@
 #include "kytyGitVersion.h"
 #include "loader/x64InstructionEmulator.h"
 
+#include <algorithm>
 #include <charconv>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +22,16 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #if defined(KYTY_PGO_GENERATE)
 #include <chrono>
 #include <cstdlib>
@@ -27,6 +39,11 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 // compiler-rt profile runtime (instrumented builds, CMake KYTY_PGO_GENERATE).
 extern "C" void __llvm_profile_set_filename(const char*);
@@ -49,7 +66,17 @@ static void StartPgoDumps() {
 	}
 	const char* seconds_text = std::getenv("KYTY_PGO_DUMP_SECONDS");
 	const int   seconds      = (seconds_text != nullptr && std::atoi(seconds_text) > 0) ? std::atoi(seconds_text) : 20;
-	static const std::string target = file;
+	// "%p" in the name becomes the process id, so repeated launches (a player's own training
+	// sessions) each keep their own profile instead of overwriting the previous one.
+	std::string name = file;
+	if (const auto at = name.find("%p"); at != std::string::npos) {
+#if defined(_WIN32)
+		name.replace(at, 2, std::to_string(_getpid()));
+#else
+		name.replace(at, 2, std::to_string(getpid()));
+#endif
+	}
+	static const std::string target = name;
 	static const std::string temp   = target + ".tmp";
 	::printf("PGO: writing the profile to %s every %d s\n", target.c_str(), seconds);
 	std::thread([seconds]() {
@@ -94,6 +121,7 @@ static void PrintUsage() {
 	::printf("Options:\n");
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
+	::printf("  --addcont-dir <dir>                  Add-ons (DLC) folder (default: none).\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf(
@@ -104,6 +132,7 @@ static void PrintUsage() {
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
+	::printf("  --keyboard-player <0-4>             Keyboard player; 0 shares player 1 with the gamepad. Default: 0.\n");
 	::printf("  --audio-master-volume <0-200>       Volume of everything on the main output. Default: 100.\n");
 	::printf("  --audio-main-volume <0-200>         Game sound (main ports). Default: 100.\n");
 	::printf("  --audio-music-volume <0-200>        Music on BGM ports. Default: 100.\n");
@@ -118,8 +147,10 @@ static void PrintUsage() {
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
+	::printf("  --hdr                                Enable HDR10 output when supported.\n");
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
+	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Intel CPU compatibility: emulate the PS5's AMD-only\n"
 	         "                                       instructions (EXTRQ/INSERTQ, AMD VRSQRTPS results).\n"
@@ -129,6 +160,7 @@ static void PrintUsage() {
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
+	::printf("  --network-connected <true|false>     Use the host local network (default: false).\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
@@ -149,9 +181,14 @@ static void PrintUsage() {
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf(
+	    "  --readback-tiled-images <true|false>  Read back small writable tiled images on submit.\n");
+	::printf(
 	    "  --sync-raw-image-buffers <true|false> Synchronize raw reads of GPU images. Default: false.\n");
 	::printf(
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
+	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
+	::printf(
+	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf(
 	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
@@ -304,13 +341,28 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		if (arg == "--hdr") {
+			options.config.hdr_enabled = true;
+			continue;
+		}
+
 		if (arg == "--hide-cursor") {
 			options.config.hide_cursor_enabled = true;
 			continue;
 		}
 
+		if (arg == "--no-splash") {
+			options.config.splash_enabled = false;
+			continue;
+		}
+
 		if (arg == "--vr") {
 			options.config.vr_enabled = true;
+			continue;
+		}
+
+		if (arg == "--perf-overlay") {
+			options.config.perf_overlay_enabled = true;
 			continue;
 		}
 
@@ -385,6 +437,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				         value.c_str());
 				return false;
 			}
+		} else if (arg == "--guest-exec") {
+			options.elf = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+			options.config.guest_arguments.assign(argv + i + 1, argv + argc);
+			break;
 		} else if (arg == "--game-patch") {
 			if (!options.game_patch.empty()) {
 				::printf("--game-patch can only be specified once\n");
@@ -398,6 +454,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.game_patch = path;
+		} else if (arg == "--addcont-dir") {
+			if (!options.addcont_dir.empty()) {
+				::printf("--addcont-dir can only be specified once\n");
+				return false;
+			}
+			options.addcont_dir = Common::PathFromUtf8(Common::FixFilenameSlash(value));
 		} else if (arg == "--screen-width") {
 			if (!ParseUint32(value, options.config.screen_width) ||
 			    options.config.screen_width == 0) {
@@ -443,6 +505,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid controller vibration intensity: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--keyboard-player") {
+			if (!ParseUint32(value, options.config.keyboard_player) ||
+			    options.config.keyboard_player > static_cast<uint32_t>(Config::MAX_PLAYERS)) {
+				::printf("invalid keyboard player: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--audio-master-volume" || arg == "--audio-main-volume" ||
 		           arg == "--audio-music-volume" || arg == "--audio-pad-speaker-volume" ||
 		           arg == "--audio-objects-volume") {
@@ -478,6 +546,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid vblank frequency: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--trophy-duration") {
+			if (!ParseUint32(value, options.config.trophy_duration_seconds)) {
+				::printf("invalid trophy duration: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());
@@ -495,6 +568,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 #else
 			setenv("KYTY_GPU_OCCLUSION", on ? "1" : "0", 1);
 #endif
+		} else if (arg == "--network-connected") {
+			if (!ParseBool(value, options.config.network_connected)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--vulkan-validation") {
 			if (!ParseBool(value, options.config.vulkan_validation_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
@@ -551,6 +629,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--readback-tiled-images") {
+			if (!ParseBool(value, options.config.readback_tiled_images)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--sync-raw-image-buffers") {
 			if (!ParseBool(value, options.config.sync_raw_image_buffers)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
@@ -596,7 +679,79 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// NVIDIA Smooth Motion makes its frames with CUDA in the driver's present layer, which initializes
+// CUDA only when the swapchain is created. By then the guest address space owns every free range
+// below HOST_USER_MAX (memoryAddressSpace.inc), CUDA finds no room for its address range there, and
+// cuInit fails with CUDA_ERROR_OUT_OF_MEMORY (2): Smooth Motion stays off (the layer's log is in
+// C:/NvPresent/logs). So CUDA is initialized here, before any reservation. Its range must not land
+// where the guest maps at fixed addresses (the default map base 0x200000000 and up, the AGC driver
+// memory at 0xfe0000000), so the free ranges below a floor are held for the duration of cuInit and
+// released right after it: CUDA's range lands above the floor, and the guest address space later
+// reserves everything around it.
+// KYTY_CUDA_EARLY_INIT=1 turns it on (default off: it adds a DLL, CUDA threads and startup time to
+// every NVIDIA run, while only RTX 40/50 drivers with Smooth Motion gain anything).
+// KYTY_CUDA_VA_FLOOR_GB: the floor in GiB, default and minimum 1024. The floor must sit above
+// the whole guest range (HOST_USER_MAX + 1 = 1008 GiB): whatever CUDA reserves below it would be a
+// permanent hole in guest VA, and a fixed-address guest mapping there would fail.
+// Without nvcuda.dll (no NVIDIA driver) nothing happens.
+static void InitCudaEarly() {
+	if (const char* value = std::getenv("KYTY_CUDA_EARLY_INIT"); value == nullptr || std::strcmp(value, "1") != 0) {
+		return;
+	}
+	HMODULE cuda = LoadLibraryExW(L"nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+	if (cuda == nullptr) {
+		return;
+	}
+	using CuInit    = int(__stdcall*)(unsigned int);
+	const auto init = reinterpret_cast<CuInit>(GetProcAddress(cuda, "cuInit"));
+	if (init == nullptr) {
+		return;
+	}
+	// 1024 GiB = 0x100_0000_0000, above HOST_USER_MAX (0xfb_ffff_ffff); the cap keeps the shift sane.
+	constexpr uint64_t MinFloorGb = 1024;
+	constexpr uint64_t MaxFloorGb = 65536;
+	uint64_t           floor_gb   = MinFloorGb;
+	if (const char* value = std::getenv("KYTY_CUDA_VA_FLOOR_GB"); value != nullptr && std::atoi(value) > 0) {
+		floor_gb = std::clamp<uint64_t>(static_cast<uint64_t>(std::atoi(value)), MinFloorGb, MaxFloorGb);
+	}
+	const uint64_t floor = floor_gb << 30u;
+	// Hold the free ranges below the floor.
+	std::vector<void*> held;
+	uint64_t           next = 0x10000;
+	while (next < floor) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(next), &info, sizeof(info)) == 0) {
+			break;
+		}
+		const auto base = reinterpret_cast<uint64_t>(info.BaseAddress);
+		const auto end  = std::min<uint64_t>(floor, base + static_cast<uint64_t>(info.RegionSize));
+		if (end <= next) {
+			break;
+		}
+		// Reservations start on the 64 KiB allocation granularity.
+		const auto start = (std::max<uint64_t>(base, next) + 0xffffu) & ~uint64_t {0xffff};
+		if (info.State == MEM_FREE && end > start) {
+			void* ptr = VirtualAlloc(reinterpret_cast<void*>(start), end - start, MEM_RESERVE, PAGE_NOACCESS);
+			if (ptr != nullptr) {
+				held.push_back(ptr);
+			}
+		}
+		next = end;
+	}
+	const int result = init(0);
+	for (void* ptr: held) {
+		VirtualFree(ptr, 0, MEM_RELEASE);
+	}
+	::printf("CUDA: initialized before the guest address space, above %" PRIu64 " GiB (cuInit %d%s)\n", floor_gb,
+	         result, result == 0 ? "" : ", NVIDIA Smooth Motion will not start");
+}
+#endif
+
 static int Main(int argc, char* argv[]) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	InitCudaEarly();
+#endif
 	VirtualMemory::Init();
 	InitializeThreads();
 #if defined(KYTY_PGO_GENERATE)

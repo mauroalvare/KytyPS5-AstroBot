@@ -102,6 +102,9 @@ constexpr size_t   PTHREAD_STACK_INITIAL   = 0x200000;
 constexpr size_t   PTHREAD_STACK_EXTRA     = 0x100000;
 constexpr uint64_t PTHREAD_STACK_TOP       = 0x7efff8000ull;
 constexpr uint64_t PTHREAD_STACK_BOTTOM    = 0x0000040000ull;
+// (The TEB's stack range on guest stacks, KYTY_GUEST_TEB_STACK_RANGE_ASM, spells the numbers out.)
+static_assert(PTHREAD_STACK_TOP == Common::HostException::GuestStacksHigh &&
+              PTHREAD_STACK_BOTTOM == Common::HostException::GuestStacksLow);
 constexpr uint32_t SIGNAL_APC_POLL_MICROS  = 10000;
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -414,6 +417,9 @@ struct PthreadMutexPrivate {
 	uint32_t                count     = 0;
 	int                     type      = 1;
 	int                     pprotocol = PTHREAD_PRIO_NONE;
+	// Waiters that have waited longer than the hand-off limit, oldest first. While it is not
+	// empty only its front thread may take the mutex (see NativeMutexLock).
+	std::vector<Pthread> starving;
 };
 
 struct PthreadMutexattrPrivate {
@@ -1023,9 +1029,7 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "movq %%gs:0x08, %%r14\n\t"
 	             "movq %%gs:0x10, %%r15\n\t"
-	             "xorq %%rcx, %%rcx\n\t"
-	             "movq %%rcx, %%gs:0x08\n\t"
-	             "movq %%rcx, %%gs:0x10\n\t"
+	             KYTY_GUEST_TEB_STACK_RANGE_ASM("%[teb_range]")
 #endif
 	             "movq %%rsp, %%r12\n\t"
 	             "movq %%rbp, %%r13\n\t"
@@ -1043,12 +1047,14 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "popq %%r13\n\t"
 	             "popq %%r12\n\t"
 	             : "=a"(ret), "+D"(arg), "+S"(func)
-	             : [guest_rsp] "0"(guest_rsp)
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	             : [guest_rsp] "0"(guest_rsp),
+	               [teb_range] "m"(Common::HostException::g_guest_teb_stack_range)
 	             : "cc", "memory", "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1",
 	               "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");
 #else
+	             : [guest_rsp] "0"(guest_rsp)
 	             : "cc", "memory", "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13",
 	               "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
 	               "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
@@ -1199,6 +1205,7 @@ void PthreadInitSelfForMainThread() {
 #endif
 	g_pthread_self->host_thread_id = os_thread_id;
 	g_pthread_main                 = g_pthread_self;
+	Common::PlaceCurrentThreadGuest();
 
 	LOGF("\tPthread main self: id = %d, os_thread_id = %" PRIu64 ", stack_addr = 0x%016" PRIx64
 	     ", stack_size = %" PRIu64 "\n",
@@ -1417,6 +1424,67 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
                                   const char* name);
 static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 
+// Guest mutex starvation guard. The mutex below is not fair: unlock wakes a waiter, but the
+// unlocking thread can take the mutex again before the woken host thread runs. A guest thread
+// that unlocks and re-locks in a loop (Wwise's audio thread does this with its global lock
+// when audio runs behind) then keeps the mutex for seconds and every other locker starves:
+// Ratchet & Clank froze with its main thread stuck in PthreadMutexLock. A waiter that has
+// waited longer than KYTY_MUTEX_HANDOFF_US (default 2000 us, 0 = off) joins the starving
+// queue; while that queue is not empty the mutex goes to its front thread only (direct
+// hand-off, like Go's sync.Mutex starvation mode). Short waits behave as before.
+static int64_t MutexHandoffMicros() {
+	static const int64_t value = [] {
+		const auto* env = std::getenv("KYTY_MUTEX_HANDOFF_US");
+		if (env == nullptr || env[0] == '\0') {
+			return static_cast<int64_t>(2000);
+		}
+		return std::max<int64_t>(0, std::strtoll(env, nullptr, 10));
+	}();
+	return value;
+}
+
+static bool MutexMayTake(const PthreadMutexPrivate* mutex, Pthread self) {
+	return mutex->owner == nullptr && (mutex->starving.empty() || mutex->starving.front() == self);
+}
+
+static void MutexLeaveStarving(PthreadMutexPrivate* mutex, Pthread self) {
+	auto it = std::find(mutex->starving.begin(), mutex->starving.end(), self);
+	if (it != mutex->starving.end()) {
+		mutex->starving.erase(it);
+	}
+}
+
+// Called with mutex->m held after each wait step: joins the starving queue once the wait is
+// longer than the hand-off limit (again if a signal handler on this thread took and released
+// the mutex in between, which removed this thread from the queue).
+static void MutexUpdateStarving(PthreadMutexPrivate* mutex, Pthread self,
+                                std::chrono::steady_clock::time_point wait_start,
+                                bool* starving) {
+	const auto limit = MutexHandoffMicros();
+	if (limit <= 0) {
+		return;
+	}
+	if (*starving) {
+		if (std::find(mutex->starving.begin(), mutex->starving.end(), self) ==
+		    mutex->starving.end()) {
+			mutex->starving.push_back(self);
+		}
+		return;
+	}
+	if (std::chrono::steady_clock::now() - wait_start >= std::chrono::microseconds(limit)) {
+		*starving = true;
+		mutex->starving.push_back(self);
+	}
+}
+
+static std::chrono::steady_clock::duration MutexWaitStep(bool starving) {
+	const auto limit = MutexHandoffMicros();
+	if (!starving && limit > 0 && limit < SIGNAL_APC_POLL_MICROS) {
+		return std::chrono::microseconds(limit);
+	}
+	return std::chrono::microseconds(SIGNAL_APC_POLL_MICROS);
+}
+
 static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_us) {
 	EXIT_IF(mutex == nullptr);
 
@@ -1433,49 +1501,66 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 			mutex->count++;
 			return OK;
 		}
-		if (timeout_us != nullptr) {
-			if (*timeout_us > 0) {
-				mutex->cv.wait_for(lock, std::chrono::microseconds(*timeout_us));
-			}
-			return ETIMEDOUT;
-		}
+		// A non-recursive self lock reports EDEADLK at once, timed or not (upstream e87fb8c85's
+		// change of this case; its FIFO hand-off is not taken).
 		return EDEADLK;
 	}
 
 	std::optional<HangWatchdog::Scope> blocked;
-	if (mutex->owner != nullptr)
+	if (!MutexMayTake(mutex, self))
 		blocked.emplace("guest-mutex", reinterpret_cast<uint64_t>(mutex),
 		                reinterpret_cast<uint64_t>(self), reinterpret_cast<uint64_t>(mutex->owner));
+	// Guest mutex waits are not cancellation points, unlike the host condition wait (upstream
+	// e87fb8c85's cancellation part; its FIFO hand-off is not taken). Only a waiting lock pays.
+	struct CancelStateGuard {
+		int  previous = 0;
+		bool active   = false;
+		~CancelStateGuard() {
+			if (active) {
+				::pthread_setcancelstate(previous, nullptr);
+			}
+		}
+	} cancel_state;
+	if (blocked) {
+		::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state.previous);
+		cancel_state.active = true;
+	}
+	const auto wait_start = std::chrono::steady_clock::now();
+	bool       starving   = false;
 	if (timeout_us == nullptr) {
-		while (mutex->owner != nullptr) {
+		while (!MutexMayTake(mutex, self)) {
 			if (blocked) blocked->Observed(reinterpret_cast<uint64_t>(mutex->owner));
-			mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
-			if (mutex->owner != nullptr) {
+			mutex->cv.wait_for(lock, MutexWaitStep(starving));
+			if (!MutexMayTake(mutex, self)) {
+				MutexUpdateStarving(mutex, self, wait_start, &starving);
 				lock.unlock();
 				KernelDispatchPendingSignalForCurrentThread();
 				lock.lock();
 			}
 		}
 	} else if (*timeout_us == 0) {
-		if (mutex->owner != nullptr) {
+		if (!MutexMayTake(mutex, self)) {
 			return ETIMEDOUT;
 		}
 	} else {
-		const auto deadline =
-		    std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us);
-		while (mutex->owner != nullptr) {
+		const auto deadline = wait_start + std::chrono::microseconds(*timeout_us);
+		while (!MutexMayTake(mutex, self)) {
 			const auto now = std::chrono::steady_clock::now();
 			if (now >= deadline) {
+				if (starving) {
+					MutexLeaveStarving(mutex, self);
+					lock.unlock();
+					// The next starving waiter may be the one allowed to take the mutex now.
+					mutex->cv.notify_all();
+				}
 				return ETIMEDOUT;
 			}
 
 			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			mutex->cv.wait_for(lock, poll);
-			if (mutex->owner != nullptr) {
+			const auto step      = MutexWaitStep(starving);
+			mutex->cv.wait_for(lock, (remaining < step ? remaining : step));
+			if (!MutexMayTake(mutex, self)) {
+				MutexUpdateStarving(mutex, self, wait_start, &starving);
 				lock.unlock();
 				KernelDispatchPendingSignalForCurrentThread();
 				lock.lock();
@@ -1483,6 +1568,9 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		}
 	}
 
+	if (!mutex->starving.empty()) {
+		MutexLeaveStarving(mutex, self);
+	}
 	mutex->owner = self;
 	mutex->count = 1;
 	return OK;
@@ -1507,7 +1595,8 @@ static int NativeMutexTrylock(PthreadMutexPrivate* mutex) {
 		return EBUSY;
 	}
 
-	if (mutex->owner != nullptr) {
+	// A starving waiter has priority (see MutexHandoffMicros).
+	if (mutex->owner != nullptr || !mutex->starving.empty()) {
 		return EBUSY;
 	}
 
@@ -1540,8 +1629,14 @@ static int NativeMutexUnlock(PthreadMutexPrivate* mutex, uint32_t* recurse = nul
 
 	mutex->owner = nullptr;
 	mutex->count = 0;
+	// With starving waiters only the queue's front may take the mutex: wake all so it runs now.
+	const bool hand_off = !mutex->starving.empty();
 	lock.unlock();
-	mutex->cv.notify_one();
+	if (hand_off) {
+		mutex->cv.notify_all();
+	} else {
+		mutex->cv.notify_one();
+	}
 
 	return OK;
 }
@@ -3388,6 +3483,7 @@ static void* RunThread(void* arg) {
 	SetThreadPriority(GetCurrentThread(),
 	                  GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));
 #endif
+	Common::PlaceCurrentThreadGuest();
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
 	     thread->name.c_str(), thread->unique_id, os_thread_id,
@@ -3543,6 +3639,11 @@ int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	// A joined thread's native handle is gone; the guest may still hold its handle.
+	if (thread->free) {
+		return KERNEL_ERROR_ESRCH;
+	}
+
 	int result = pthread_cancel(thread->p);
 
 	LOGF("\tthread cancel: %s, %d\n", thread->name.c_str(), result);
@@ -3646,10 +3747,8 @@ int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 
 	EXIT_NOT_IMPLEMENTED(prio == nullptr);
 
-	sched_param native_param {};
-	int         native_policy = 0;
-	if (pthread_getschedparam(thread->p, &native_policy, &native_param) != 0) {
-		return KERNEL_ERROR_EINVAL;
+	if (thread->free) {
+		return KERNEL_ERROR_ESRCH;
 	}
 
 	*prio = thread->attr->guest_priority;
@@ -3663,6 +3762,11 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	PRINT_NAME();
 
 	if (thread == nullptr) {
+		return KERNEL_ERROR_ESRCH;
+	}
+
+	// A joined thread's native handle is gone; the guest may still hold its handle.
+	if (thread->free) {
 		return KERNEL_ERROR_ESRCH;
 	}
 

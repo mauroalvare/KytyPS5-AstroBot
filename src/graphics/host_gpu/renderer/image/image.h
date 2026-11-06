@@ -511,10 +511,16 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
+	// Stencil associations that refer to this depth image (upstream f4692a450).
+	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last  = 0;
 	uint64_t         frame_accessed_last = 0; // presented guest frames, see TextureCache::AdvanceFrame
+	// KYTY_PIPELINE_SKIP: the last presented frame (+1) this image was a draw's render target, and
+	// in how many distinct frames it was one (saturating), see DrawOnlyChangesPicture.
+	uint64_t         skip_target_frame  = 0;
+	uint32_t         skip_target_frames = 0;
 	size_t           lru_id              = 0;
 	// While registered: the tick of TextureCache's LRU item lru_id (KYTY_IMAGE_LRU_SKIP). Set from
 	// the item after every Insert (RegisterImage) and Touch (TouchImage), its only writers.

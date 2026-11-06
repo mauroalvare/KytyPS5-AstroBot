@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/hangTrace.h"
+#include "common/liveSwitch.h"
 #include "common/onceValue.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
@@ -33,6 +34,12 @@
 
 namespace Libs::Graphics {
 
+// KYTY_CP_SINK_ROUTES (default 1, live): CommandBuffer::HelperSink() encodes for the recorder; 0
+// drains it and records natively, as the helpers' former Handle() did.
+static Live::Switch g_sink_routes("KYTY_CP_SINK_ROUTES", Live::ParseDefaultOn);
+// KYTY_DISPATCH_OVERLAP (render.h DispatchOverlapEnabled): live; default on.
+static Live::Switch g_dispatch_overlap("KYTY_DISPATCH_OVERLAP", Live::ParseDefaultOn);
+
 // ------------------------------------------------------------------------------------------------
 // Barrier batcher
 
@@ -43,6 +50,34 @@ static bool EnvSwitch(const char* name, bool default_value) {
 	}
 	return !(std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
 	         std::strcmp(value, "off") == 0);
+}
+
+// KYTY_DEPTH_RO_STORE_NONE=1 (default off; chenxiao07/KytyPS5 ef46df82f): a depth or stencil
+// aspect the rendering's attachment layout makes read-only is stored with STORE_OP_NONE. The draws
+// of such a pass cannot write it, and STORE_OP_STORE is a write for synchronization (a pass that
+// tests against the depth buffer it also samples, then the next transition of it: a
+// write-after-write the barrier made for the shader reads did not cover) and a write-back for the
+// driver.
+static vk::AttachmentStoreOp DepthStoreOp(vk::ImageLayout layout, bool stencil) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DEPTH_RO_STORE_NONE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (enabled) {
+		switch (layout) {
+			case vk::ImageLayout::eDepthStencilReadOnlyOptimal: return vk::AttachmentStoreOp::eNone;
+			case vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal:
+			case vk::ImageLayout::eDepthReadOnlyOptimal:
+				if (!stencil) return vk::AttachmentStoreOp::eNone;
+				break;
+			case vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal:
+			case vk::ImageLayout::eStencilReadOnlyOptimal:
+				if (stencil) return vk::AttachmentStoreOp::eNone;
+				break;
+			default: break;
+		}
+	}
+	return vk::AttachmentStoreOp::eStore;
 }
 
 bool BarrierBatchEnabled() {
@@ -254,6 +289,14 @@ CommandSink CommandBuffer::Sink() const {
 	return CommandSink(*this);
 }
 
+CommandSink CommandBuffer::HelperSink() const {
+	if (Encoding() && !g_sink_routes.On()) {
+		// The former Handle() path: drain, then record natively in the direct window.
+		(void)Handle();
+	}
+	return Sink();
+}
+
 CommandSink CommandBuffer::StateSink() const {
 	EXIT_IF(IsInvalid());
 	return CommandSink(*this);
@@ -293,6 +336,36 @@ void CommandBuffer::ResetBarrierState() const {
 	m_epoch_instance       = 0;
 	m_internal_recording   = 0;
 	m_feedback_keep.reset();
+	m_overlap_open         = false;
+}
+
+bool DispatchOverlapEnabled() {
+	return BarrierBatchEnabled() && g_dispatch_overlap.Get() != 0;
+}
+
+void CommandBuffer::NoteGuestDispatch(bool lds) const {
+	// Called right after the dispatch's ShaderAccess request: nothing may have been recorded or
+	// requested since the dispatch except that request.
+	m_overlap_open = BarrierBatchEnabled() && m_pending.has_memory && m_pending.images.empty() &&
+	                 m_pending.buffers.empty() && m_pending.uploads.empty() &&
+	                 m_pending.origins == OriginBit(BarrierOrigin::ShaderAccess);
+	m_overlap_lds = lds;
+}
+
+bool CommandBuffer::TakeDispatchOverlap(bool lds, bool take) const {
+	const bool open = m_overlap_open;
+	m_overlap_open  = false;
+	if (!open || lds || m_overlap_lds || !m_pending.has_memory || !m_pending.images.empty() ||
+	    !m_pending.buffers.empty() || !m_pending.uploads.empty() ||
+	    m_pending.origins != OriginBit(BarrierOrigin::ShaderAccess)) {
+		return false;
+	}
+	if (take) {
+		// The next dispatch's own ShaderAccess request covers the dropped one: its first scope is
+		// every earlier compute shader access, the dropped dispatch's included.
+		m_pending.Clear();
+	}
+	return true;
 }
 
 void CommandBuffer::NoteFeedbackKeep(const vk::ImageMemoryBarrier2& ordering) const {
@@ -584,6 +657,7 @@ void CommandBuffer::FlushBarriers() const {
 	// barriers were widened by the same scopes above.
 	m_epoch_clean    = m_pending.has_memory && IsFullBarrier(m_pending.memory);
 	m_epoch_instance = 0;
+	m_overlap_open   = false;
 	m_pending.Clear();
 }
 
@@ -618,6 +692,7 @@ bool CommandBuffer::CanSinkDrawWrites() const {
 
 void CommandBuffer::NoteDrawRecorded() const {
 	m_recorded_since_flush = true;
+	m_overlap_open         = false;
 	if (!(m_draw_scope && m_draw_safe && m_rendering && m_epoch_instance == m_rendering_serial)) {
 		m_epoch_clean = false;
 	}
@@ -865,6 +940,24 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	}
 }
 
+// The same rendering: the size, the layers, the depth/stencil attachment and the color attachments
+// up to the count (those past it are no part of a rendering; the defaulted comparison read all eight
+// at every draw; chenxiao07/KytyPS5 7bce89917).
+static bool SameRendering(const RenderState& a, const RenderState& b) {
+	if (a.num_color_attachments != b.num_color_attachments || a.width != b.width ||
+	    a.height != b.height || a.num_layers != b.num_layers ||
+	    !(a.depth_stencil_attachment == b.depth_stencil_attachment)) {
+		return false;
+	}
+	const auto count = std::min<uint32_t>(a.num_color_attachments, RENDER_COLOR_ATTACHMENTS_MAX);
+	for (uint32_t i = 0; i < count; i++) {
+		if (!(a.color_attachments[i] == b.color_attachments[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void CommandBuffer::BeginRendering(const RenderState& state) const {
 	const auto count_control = GetRegisters().GetDepthCountControl();
 	auto&      occlusion     = m_context.GetOcclusionCounter();
@@ -873,7 +966,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	const bool same_control =
 	    m_occlusion_control == count_control ||
 	    (OcclusionCounter::GateEnabled() && !occlusion.Active() && !occlusion.WouldCount(count_control));
-	const bool same_instance = m_rendering && m_render_state == state && same_control;
+	const bool same_instance = m_rendering && SameRendering(m_render_state, state) && same_control;
 	if (same_instance) {
 		m_occlusion_control = count_control;
 	}
@@ -913,7 +1006,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		if (barrier_split) {
 			KYTY_GPU_OP_SITE("render.barrier_split");
 			EndRendering();
-		} else if (m_render_state == state) {
+		} else if (SameRendering(m_render_state, state)) {
 			KYTY_GPU_OP_SITE("render.occlusion_control");
 			EndRendering();
 		} else {
@@ -953,7 +1046,8 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	depth.imageLayout = depth_stencil.image_layout;
 	depth.loadOp =
 	    depth_stencil.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
-	depth.storeOp                       = vk::AttachmentStoreOp::eStore;
+	depth.storeOp = depth_stencil.depth_clear ? vk::AttachmentStoreOp::eStore
+	                                          : DepthStoreOp(depth_stencil.image_layout, false);
 	depth.clearValue.depthStencil.depth = std::bit_cast<float>(depth_stencil.clear_value[0]);
 
 	vk::RenderingAttachmentInfo stencil {};
@@ -961,7 +1055,8 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	stencil.imageLayout = depth_stencil.image_layout;
 	stencil.loadOp =
 	    depth_stencil.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
-	stencil.storeOp                         = vk::AttachmentStoreOp::eStore;
+	stencil.storeOp = depth_stencil.stencil_clear ? vk::AttachmentStoreOp::eStore
+	                                              : DepthStoreOp(depth_stencil.image_layout, true);
 	stencil.clearValue.depthStencil.stencil = depth_stencil.clear_value[1];
 
 	vk::RenderingInfo rendering {};
@@ -988,7 +1083,13 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 			                    static_cast<uint32_t>(db.z_info.format));
 		}
 	}
+	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state = state;
+	for (auto& color: m_render_state.color_attachments) {
+		color.is_clear = false;
+	}
+	m_render_state.depth_stencil_attachment.depth_clear   = false;
+	m_render_state.depth_stencil_attachment.stencil_clear = false;
 	m_rendering    = true;
 	++m_rendering_serial;
 	m_occlusion_control = count_control;

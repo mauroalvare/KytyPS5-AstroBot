@@ -1,7 +1,9 @@
+#include "common/debugCounters.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -27,13 +29,16 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
+#include <tuple>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -46,6 +51,54 @@
 #include <vector>
 
 namespace Libs::Graphics {
+// KYTY_DISPATCH_OVERLAP accounting, printed every 10 s once a direct dispatch ran:
+//   DispatchOverlap 10s (on|off): <direct> direct dispatches, <pairs> unordered pairs (<pct>%),
+//   <overlapped> overlapped, <indirect> indirect (<empty> empty skipped, KYTY_SKIP_EMPTY_INDIRECT)
+// An unordered pair is a direct dispatch that followed another with nothing in between (it would
+// overlap with the switch on); counted with the switch off too, for sizing.
+static std::atomic<uint64_t> g_overlap_direct {0}, g_overlap_pairs {0}, g_overlap_taken {0},
+    g_overlap_indirect {0}, g_overlap_empty_indirect {0};
+static Live::Switch g_skip_empty_indirect("KYTY_SKIP_EMPTY_INDIRECT", Live::ParseDefaultOn);
+static std::atomic<int64_t> g_overlap_last_print_ns {0};
+
+static void PrintDispatchOverlap(bool enabled) {
+	const auto now = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                          std::chrono::steady_clock::now().time_since_epoch())
+	                                          .count());
+	auto last = g_overlap_last_print_ns.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_overlap_last_print_ns.store(now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10'000'000'000ll ||
+	    !g_overlap_last_print_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	const auto direct   = g_overlap_direct.exchange(0, std::memory_order_relaxed);
+	const auto pairs    = g_overlap_pairs.exchange(0, std::memory_order_relaxed);
+	const auto taken    = g_overlap_taken.exchange(0, std::memory_order_relaxed);
+	const auto indirect = g_overlap_indirect.exchange(0, std::memory_order_relaxed);
+	const auto empty    = g_overlap_empty_indirect.exchange(0, std::memory_order_relaxed);
+	std::printf("DispatchOverlap 10s (%s): %llu direct dispatches, %llu unordered pairs (%.1f%%), "
+	            "%llu overlapped, %llu indirect (%llu empty skipped)\n",
+	            enabled ? "on" : "off", static_cast<unsigned long long>(direct),
+	            static_cast<unsigned long long>(pairs),
+	            direct != 0 ? 100.0 * static_cast<double>(pairs) / static_cast<double>(direct) : 0.0,
+	            static_cast<unsigned long long>(taken), static_cast<unsigned long long>(indirect),
+	            static_cast<unsigned long long>(empty));
+}
+
+static void CountDispatchOverlap(bool unordered, bool enabled) {
+	g_overlap_direct.fetch_add(1, std::memory_order_relaxed);
+	if (unordered) {
+		g_overlap_pairs.fetch_add(1, std::memory_order_relaxed);
+		if (enabled) {
+			g_overlap_taken.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	PrintDispatchOverlap(enabled);
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -58,8 +111,21 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	return true;
 }
 
-bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-                                                const CommandBuffer&          buffer) {
+// KYTY_COMPUTE_META_CLEAR_DISPATCH=1 (default off; upstream 01ce97388's behaviour): a dispatch
+// whose buffer writes recorded a metadata clear (UpdateComputeMetaClears) still runs, so its guest
+// writes to the metadata memory are kept for readers that reuse it as an ordinary buffer. Off, the
+// recorded clear consumes the dispatch, as before.
+static bool ComputeMetaClearDispatchEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_COMPUTE_META_CLEAR_DISPATCH");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// Whether a metadata clear was recorded.
+bool RenderExecutor::UpdateComputeMetaClears(const ShaderComputeInputInfo& input,
+                                            const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
@@ -69,26 +135,24 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		// A metadata resource that is also read is not proven to be a full overwrite. Execute it
-		// conservatively instead of replacing the dispatch with a coarse full-surface clear.
+		// Reads and transforms of metadata do not establish a clear state.
 		if ((!resource.written || resource.read) && cache.IsMeta(descriptor.Base48())) {
 			return false;
 		}
 	}
 
+	bool cleared = false;
 	if (!program.info.has_bitwise_xor) {
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& resource = program.info.buffers[i];
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
-					return true;
-				}
+				cleared |= cache.ClearMeta(descriptor.Base48());
 			}
 		}
 	}
-	return false;
+	return cleared;
 }
 
 bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
@@ -286,9 +350,21 @@ bool RenderExecutor::BindComputeLds(const ShaderComputeInputInfo& input, Prepare
 	return true;
 }
 
+// KYTY_ORDERED_APPEND=1 (default off; upstream d4465faa7): a dispatch with
+// DISPATCH_INITIATOR.ORDERED_APPEND_ENABLE whose program uses GDS and whose workgroups are one
+// guest wave without emulated LDS runs one workgroup per vkCmdDispatchBase, in launch order with a
+// barrier between them, so ordered-append counters see the workgroups in order. Logged once.
+bool OrderedAppendSplitEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_ORDERED_APPEND");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
-                                    uint32_t thread_group_z, uint32_t mode) {
+                                    uint32_t thread_group_z, uint32_t mode, bool async_compute) {
 	KYTY_GPU_OP_SITE("dispatch");
 	// KYTY_CP_GAP_STATS: this scope's phases (drawPrep/cpGaps.h).
 	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);
@@ -351,12 +427,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	DrawPrep::MakeComputeInputInfo(cs_regs, {thread_group_x, thread_group_y, thread_group_z, mode},
 	                               input_info);
+	// After MakeComputeInputInfo (it resets the info). Part of the program key (GETREG HW_ID2).
+	input_info.async_compute = async_compute;
 	CpGaps::Phase(CpGaps::Cat::DispatchProgram);
 	ShaderProgram compute_program;
 	// KYTY_DRAW_PREP_DISPATCH (drawPrep.h): the program a worker prepared from this dispatch's
-	// register snapshot, when its certificate holds; otherwise the serial lookup.
+	// register snapshot, when its certificate holds; otherwise the serial lookup. Workers prepare
+	// graphics-queue dispatches only (MakeComputeInputInfo leaves async_compute false).
 	auto* const prepared = std::exchange(m_prepared_dispatch, nullptr);
-	if (prepared != nullptr && DrawPrep::ValidateDispatch(*prepared, input_info)) {
+	if (prepared != nullptr && !async_compute && DrawPrep::ValidateDispatch(*prepared, input_info)) {
 		if (DrawPrep::VerifyMode() != 0) {
 			// The serial lookup on copies; it only reads memory the certificate proved clean.
 			auto serial_prep = std::make_unique<PipelineCache::StagePrep>();
@@ -386,7 +465,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+	// A recorded metadata clear consumes the dispatch unless KYTY_COMPUTE_META_CLEAR_DISPATCH keeps
+	// its guest writes (upstream 01ce97388).
+	if (UpdateComputeMetaClears(input_info, buffer) && !ComputeMetaClearDispatchEnabled()) {
 		ResetBindings();
 		return;
 	}
@@ -455,7 +536,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	CpGaps::Phase(CpGaps::Cat::DispatchRebind);
 	RebindImages(bindings);
 	BindComputeLds(input_info, bindings, input_info.workgroup_counts);
+	m_rebind_epoch = m_context.GetBufferCache().UnregisterEpoch();
 	RebindBuffers(bindings);
+	// KYTY_REBIND_AFTER_JOIN: a later binding's lookup joined a buffer an earlier one resolved.
+	if (RebindAfterJoinEnabled()) {
+		auto& cache = m_context.GetBufferCache();
+		for (uint32_t pass = 0; pass < 4 && cache.UnregisterEpoch() != m_rebind_epoch; pass++) {
+			NoteRebindAfterJoin("dispatch", nullptr);
+			m_rebind_epoch = cache.UnregisterEpoch();
+			RebindBuffers(bindings);
+		}
+	}
 	CpGaps::Phase(CpGaps::Cat::DispatchEmit);
 
 	PreparedBindings* descriptor_stage = &bindings;
@@ -476,7 +567,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
+	// KYTY_DISPATCH_OVERLAP (render.h): nothing happened since the previous dispatch, so the guest
+	// did not order the two; its pending ShaderAccess request is dropped and this dispatch skips
+	// its own hazard request. Emulated LDS (one device buffer) and BDA-write settles never overlap.
+	const bool no_overlap      = bindings.shared_memory.buffer != nullptr || program.info.bda_writes;
+	const bool overlap_enabled = DispatchOverlapEnabled();
+	const bool overlap         = buffer.TakeDispatchOverlap(no_overlap, overlap_enabled);
+	CountDispatchOverlap(overlap, overlap_enabled);
+	if (has_storage_writes && !(overlap && overlap_enabled)) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -488,11 +586,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		    });
 		const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
 		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
-		     " hash=0x%016" PRIx64 " tick=%" PRIu64
+		     " hash=0x%016" PRIx64 " tick=%" PRIu64 " completed_tick=%" PRIu64
 		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
 		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, program.shader_hash,
 		     m_context.GetCommandScheduler().CurrentTick(),
+		     m_context.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick(),
 		     thread_group_x, thread_group_y, thread_group_z, mode,
 		     input_info.threads_num[0], input_info.threads_num[1],
 		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size(),
@@ -541,10 +640,37 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
+	constexpr uint32_t DispatchInitiatorOrderedAppendEnable = 1u << 3u;
+	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
+	                               std::max(input_info.threads_num[1], 1u) *
+	                               std::max(input_info.threads_num[2], 1u);
+	if (OrderedAppendSplitEnabled() && (mode & DispatchInitiatorOrderedAppendEnable) != 0 &&
+	    (ShaderRecompiler::IR::FindBinding(program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) && group_threads <= input_info.wave_size && !input_info.lds_storage) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			std::printf("KYTY_ORDERED_APPEND: shader 0x%016" PRIx64
+			            " runs %ux%ux%u ordered-append workgroups one by one\n",
+			            program.shader_hash, thread_group_x, thread_group_y, thread_group_z);
+			std::fflush(stdout);
+		}
+		for (uint32_t z = 0; z < thread_group_z; ++z) {
+			for (uint32_t y = 0; y < thread_group_y; ++y) {
+				for (uint32_t x = 0; x < thread_group_x; ++x) {
+					if ((x | y | z) != 0u) {
+						ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+					}
+					buffer.Sink().dispatchBase(x, y, z, 1, 1, 1);
+				}
+			}
+		}
+	} else {
+		buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+	buffer.NoteGuestDispatch(no_overlap);
 	if (program.info.bda_writes) {
 		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);
 	}
@@ -606,8 +732,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
-                                      uint64_t args_addr, uint32_t mode) {
+                                      uint64_t args_addr, uint32_t mode, bool async_compute) {
 	KYTY_GPU_OP_SITE("dispatch.indirect");
+	g_overlap_indirect.fetch_add(1, std::memory_order_relaxed);
 	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
@@ -623,11 +750,23 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
+	input_info.async_compute = async_compute;
 	CpGaps::Phase(CpGaps::Cat::DispatchProgram);
 	ShaderProgram compute_program;
 	// KYTY_DRAW_PREP_DISPATCH (drawPrep.h): as in DispatchDirect, from no workgroup counts.
 	auto* const prepared = std::exchange(m_prepared_dispatch, nullptr);
-	if (prepared != nullptr && DrawPrep::ValidateDispatch(*prepared, input_info)) {
+	// KYTY_SKIP_EMPTY_INDIRECT (live, default on; upstream be5915c24): arguments no GPU write is
+	// pending for, read from guest memory, with a zero group count: the dispatch does nothing.
+	if (g_skip_empty_indirect.Get() != 0) {
+		vk::DispatchIndirectCommand args {};
+		if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+		    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
+		    (args.x == 0 || args.y == 0 || args.z == 0)) {
+			g_overlap_empty_indirect.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+	}
+	if (prepared != nullptr && !async_compute && DrawPrep::ValidateDispatch(*prepared, input_info)) {
 		if (DrawPrep::VerifyMode() != 0) {
 			auto serial_prep = std::make_unique<PipelineCache::StagePrep>();
 			auto serial_info = input_info;
@@ -680,10 +819,23 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindComputeLds(input_info, bindings, nullptr);
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
-	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+	m_rebind_epoch = m_context.GetBufferCache().UnregisterEpoch();
+	auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	// KYTY_REBIND_AFTER_JOIN: the bindings' lookups joined the argument buffer (or one another's).
+	if (RebindAfterJoinEnabled()) {
+		auto& cache = m_context.GetBufferCache();
+		for (uint32_t pass = 0; pass < 4 && cache.UnregisterEpoch() != m_rebind_epoch; pass++) {
+			NoteRebindAfterJoin("indirect dispatch", nullptr);
+			m_rebind_epoch               = cache.UnregisterEpoch();
+			std::tie(args_buffer, args_offset) =
+			    cache.ObtainBuffer(args_addr, sizeof(vk::DispatchIndirectCommand), false);
+			EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+			RebindBuffers(bindings);
+		}
+	}
 	CpGaps::Phase(CpGaps::Cat::DispatchEmit);
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (see DispatchDirect).
@@ -721,6 +873,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatchIndirect(args_buffer->Handle(), args_offset);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	if (program.info.bda_writes) {
 		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);

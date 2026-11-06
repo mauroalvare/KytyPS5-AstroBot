@@ -2,9 +2,11 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/guestLoad.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
 #include "common/liveSwitch.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
 #include "common/profiler.h"
@@ -15,9 +17,11 @@
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
+#include "graphics/host_gpu/readFaultDiag.h"
 #include "graphics/host_gpu/renderer/cache/bufferLookupStats.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
@@ -33,6 +37,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -43,12 +48,21 @@
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <mutex>
+#include <optional>
 #include <span>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <x86intrin.h>
+#endif
 
 #if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
 #include <xmmintrin.h>
@@ -300,6 +314,106 @@ std::atomic<uint64_t> g_readback_flush_side_copies {0};
 Live::Switch g_readback_side_writes("KYTY_READBACK_SIDE_WRITES", Live::ParseDefaultOn);
 std::atomic<uint64_t> g_readback_side_writes_copies {0};
 
+// KYTY_READ_FAULT_PUBLISHED (live, default off; =1 on, =verify): a guest thread's read fault on a
+// page whose bytes the GPU owns does not wait for the GPU. When the faulting instruction is a
+// plain load (common/guestLoad.h) of bytes within one page, no image owns the page, and a side or
+// eager readback published the page at most KYTY_READ_FAULT_PUBLISHED_FRAMES guest frames ago
+// (default 2), the load completes in the handler with the page's backing bytes: the GPU-written
+// bytes as last published, the other bytes as they are. The page stays protected (no access) for
+// everyone else, so the command processor and the emulator still synchronize through their own
+// faults and later writes still fault; the read marks the page read-hot, so its eager copy
+// publishes the new bytes once their writer completes. Other reads take the waiting path. This is
+// what a CPU sees that reads GPU-written memory without waiting for the writer: legitimate only for
+// reads the game does not order after the writer (with KYTY_LABEL_MODE=record, Kyty cannot tell,
+// since end-of-pipe labels are written when recorded). Astro Bot's render threads read a GPU-written
+// value this way every frame (eboot 0x736fa9e).
+// =verify takes the waiting path for every read, and compares the bytes the load would have been
+// served with those it finds after the wait (equal / different counts, the first differences).
+// One "Kyty read-fault published" line every 10 s while on.
+int64_t ParseReadFaultPublished(const char* value) {
+	if (value == nullptr || std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	return std::strcmp(value, "verify") == 0 ? 2 : 1;
+}
+Live::Switch g_read_fault_published("KYTY_READ_FAULT_PUBLISHED", ParseReadFaultPublished);
+
+uint32_t ReadFaultPublishedFrames() {
+	static const uint32_t frames = [] {
+		const auto* value = std::getenv("KYTY_READ_FAULT_PUBLISHED_FRAMES");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 2u;
+	}();
+	return frames;
+}
+
+struct ReadFaultPublishedState {
+	std::mutex                             mutex;
+	std::unordered_map<uint64_t, uint32_t> published_frame; // tracker page -> guest frame
+	std::atomic<uint64_t>                  served {0};
+	std::atomic<uint64_t>                  undecodable {0};
+	std::atomic<uint64_t>                  image {0};
+	std::atomic<uint64_t>                  stale {0};
+	std::atomic<uint64_t>                  other {0};
+	std::atomic<uint64_t>                  burst {0};
+	std::atomic<uint64_t>                  verify_equal {0};
+	std::atomic<uint64_t>                  verify_different {0};
+	std::atomic<uint64_t>                  report_ns {0};
+	std::atomic<uint32_t>                  report_frame {0};
+	std::atomic<uint32_t>                  logged {0};
+};
+ReadFaultPublishedState& ReadFaultPublished() {
+	static ReadFaultPublishedState state;
+	return state;
+}
+
+// While the switch is on: the guest frame in which a readback last published each page of `ranges`.
+void NoteReadFaultPublication(std::span<const GuestRange> ranges, uint32_t frame) {
+	auto&           state = ReadFaultPublished();
+	std::lock_guard lock(state.mutex);
+	for (const auto& range: ranges) {
+		const auto last = range.address + range.size;
+		for (auto page = Common::AlignDown(range.address, TRACKER_PAGE_SIZE); page < last;
+		     page += TRACKER_PAGE_SIZE) {
+			state.published_frame[page] = frame;
+		}
+	}
+	if (state.published_frame.size() > 8192) {
+		std::erase_if(state.published_frame,
+		              [frame](const auto& entry) { return frame - entry.second > 600; });
+	}
+}
+
+[[nodiscard]] bool ReadFaultPublishedRecently(uint64_t page, uint32_t frame) {
+	auto&           state = ReadFaultPublished();
+	std::lock_guard lock(state.mutex);
+	const auto      found = state.published_frame.find(page);
+	return found != state.published_frame.end() &&
+	       frame - found->second <= ReadFaultPublishedFrames();
+}
+
+void ReportReadFaultPublished(uint32_t frame) {
+	auto&      state = ReadFaultPublished();
+	const auto now   = ReadFaultDiag::NowNs();
+	auto       last  = state.report_ns.load(std::memory_order_relaxed);
+	if (last == 0) {
+		state.report_ns.compare_exchange_strong(last, now);
+		state.report_frame.store(frame, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10'000'000'000ull || !state.report_ns.compare_exchange_strong(last, now)) {
+		return;
+	}
+	const auto frames = std::max<uint32_t>(1, frame - state.report_frame.exchange(frame));
+	const auto take   = [](std::atomic<uint64_t>& counter) { return counter.exchange(0); };
+	const auto served = take(state.served);
+	std::printf("Kyty read-fault published 10s: %u frames, served %" PRIu64 " (%.2f/frame); waited: "
+	            "not a plain load %" PRIu64 ", image %" PRIu64 ", not published recently %" PRIu64
+	            ", other %" PRIu64 ", copy burst %" PRIu64 "; verify: equal %" PRIu64 ", different %" PRIu64 "\n",
+	            frames, served, static_cast<double>(served) / frames, take(state.undecodable),
+	            take(state.image), take(state.stale), take(state.other), take(state.burst), take(state.verify_equal),
+	            take(state.verify_different));
+}
+
 // The number of regions copies (source ascending) give when a copy starting at most `gap` bytes
 // after the previous region's source end joins it.
 uint64_t CountMergedRegions(std::span<const vk::BufferCopy> copies, uint64_t gap) {
@@ -504,6 +618,55 @@ bool DirtyQueryCombinedEnabled() {
 // KYTY_STREAM_DIRECT_READ=1 (default off; upstream 37501b5a7): a small read binding copied into
 // the stream buffer reads the guest bytes through the guest mapping instead of the backing store
 // (TryReadBacking). Its pages are CPU-dirty and not GPU-dirty, so no protection stops the read.
+BufferCache* g_defer_cache = nullptr; // the BufferCache whose stream copies are deferred
+UploadDma*   g_write_drain_dma = nullptr; // KYTY_UPLOAD_DMA_WRITE_DRAIN: the cache's upload DMA
+
+bool StreamCopyProbe() {
+	static const bool enabled = ParseEnvU64("KYTY_STREAM_COPY_PROBE", 0) != 0;
+	return enabled;
+}
+
+void StreamCopyProbeAdd(uint64_t size, uint64_t cycles, uint64_t vaddr) {
+	static uint64_t count = 0, bytes = 0, total = 0, large = 0, start = 0, dup = 0, dup_bytes = 0;
+	static uint64_t hist[8] = {};
+	static std::unordered_map<uint64_t, uint64_t> last;
+	{
+		const auto key = vaddr ^ (size << 44u);
+		const auto t   = __rdtsc();
+		auto [it, inserted] = last.try_emplace(key, t);
+		if (!inserted) {
+			if (t - it->second < 33'600'000ull) { // 8 ms
+				dup++;
+				dup_bytes += size;
+			}
+			it->second = t;
+		}
+	}
+	count++;
+	bytes += size;
+	total += cycles;
+	hist[std::min<uint64_t>(std::bit_width(size) / 2u, 7u)]++;
+	large += size > 4096 ? 1u : 0u;
+	const auto now = __rdtsc();
+	if (start == 0) {
+		start = now;
+	}
+	if (now - start >= 42'000'000'000ull) {
+		std::printf("StreamCopy 10s: dup8ms %" PRIu64 " dupbytes %" PRIu64 " keys %zu ", dup, dup_bytes, last.size());
+		dup = dup_bytes = 0;
+		last.clear();
+		std::printf("copies %" PRIu64 " bytes %" PRIu64 " cycles %" PRIu64
+		            " large %" PRIu64 " sizes(log4) %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
+		            " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
+		            count, bytes, total, large, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5],
+		            hist[6], hist[7]);
+		std::fflush(stdout);
+		count = bytes = total = large = 0;
+		std::fill(std::begin(hist), std::end(hist), 0u);
+		start = now;
+	}
+}
+
 bool StreamDirectReadEnabled() {
 	static const bool enabled = ParseEnvU64("KYTY_STREAM_DIRECT_READ", 0) != 0;
 	return enabled;
@@ -678,6 +841,8 @@ struct BufferCache::SideReadback {
 	uint32_t                slot        = 0;
 	bool                    eager       = false;
 	uint64_t                publication = 0;
+	// Side copies: the master tick the copy waits for (KYTY_READ_FAULT_DIAG).
+	uint64_t                producer    = 0;
 	// HangTrace clock at issue (eager rows report issue-to-publication time).
 	uint64_t                issue_ns    = 0;
 	// Staged at (address - begin) within the slot.
@@ -981,6 +1146,7 @@ void BufferCache::Register(BufferId id) {
 }
 
 void BufferCache::Unregister(BufferId id) {
+	m_unregister_epoch++;
 	ChangeRegister<false>(id);
 }
 
@@ -1124,6 +1290,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	std::vector<vk::BufferCopy> regions;
 	total_size = PackDownloadRegions(copies, static_cast<uint64_t>(g_readback_merge_gap.Get()), regions);
 	RecordReadbackRegions(copies, regions);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	// A download larger than the staging ring gets a buffer of its own, released after the
@@ -1336,6 +1503,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
 	m_range_memo_verify = m_range_memo != nullptr ? RangeMemoVerifyMode() : 0;
+	if (m_upload_dma != nullptr) {
+		g_write_drain_dma = m_upload_dma.get(); // KYTY_UPLOAD_DMA_WRITE_DRAIN
+	}
 	m_relaxed_queries = RelaxedQueriesEnabled();
 	m_bda_dirty_log   = m_bda_hot_sync && BdaDirtyLogEnabled();
 	if (m_bda_dirty_log) {
@@ -1380,6 +1550,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	}
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
+	m_scheduler.BeginCommand();
+	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
+		buffer->Fill(0, buffer->Size(), 0);
+	}
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
@@ -1410,6 +1584,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	if (g_defer_cache == this) {
+		g_defer_cache = nullptr;
+	}
+	if (m_upload_dma != nullptr && g_write_drain_dma == m_upload_dma.get()) {
+		g_write_drain_dma = nullptr;
+	}
 	if (m_upload_dma != nullptr) {
 		// The scheduler has drained by now; no later submission may wait on the upload DMA.
 		m_scheduler.SetSubmitDependency(nullptr, 1);
@@ -1622,7 +1802,201 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 	}
 }
 
+namespace {
+
+// KYTY_READ_FAULT_DIAG (readFaultDiag.h): one guest read fault of the diagnosed page, printed
+// when ReadMemory returns.
+class ReadFaultDiagScope {
+public:
+	ReadFaultDiagScope(uint64_t vaddr, MasterSemaphore& master) {
+		m_fault.start_ns    = ReadFaultDiag::NowNs();
+		m_fault.fault_vaddr = vaddr;
+		auto& state         = ReadFaultDiag::Get();
+		m_write_ns          = state.write_ns.load(std::memory_order_acquire);
+		m_write_tick        = state.write_tick.load(std::memory_order_relaxed);
+		m_write_caller      = state.write_caller.load(std::memory_order_relaxed);
+		m_current           = master.CurrentTick();
+		master.Refresh();
+		m_gpu = master.KnownGpuTick();
+		if (const auto& progress = master.GetSubmissionProgress(); progress != nullptr) {
+			m_dispatched = progress->dispatched_tick.load(std::memory_order_acquire);
+		}
+		ReadFaultDiag::t_fault = &m_fault;
+	}
+	~ReadFaultDiagScope() {
+		ReadFaultDiag::t_fault = nullptr;
+		auto& state = ReadFaultDiag::Get();
+		if (state.lines.fetch_add(1, std::memory_order_relaxed) >= MaxLines()) {
+			return;
+		}
+		const auto end     = ReadFaultDiag::NowNs();
+		const auto labels  = ReadFaultDiag::LabelsBetween(m_write_ns, m_fault.start_ns);
+		const auto us      = [](uint64_t ns) { return static_cast<double>(ns) / 1e3; };
+		const auto age     = [&](uint64_t ns) { return ns != 0 ? us(m_fault.start_ns - ns) : -1.0; };
+		const auto publish = m_fault.phases_end_ns != 0 ? end - m_fault.phases_end_ns : 0;
+		char       thread[64] {};
+		FaultCost::DescribeThread(thread, sizeof(thread));
+		const auto rip  = FaultCost::FaultInstruction();
+		const auto base = FaultCost::ExeBase();
+		{
+			// The faulting guest instruction's bytes, once per instruction.
+			static std::mutex                   seen_mutex;
+			static std::unordered_set<uint64_t> seen;
+			std::unique_lock                    seen_lock(seen_mutex);
+			if (rip != 0 && seen.size() < 64 && seen.insert(rip).second) {
+				seen_lock.unlock();
+				uint8_t code[16] {};
+				if (HangTrace::TryReadReadable(rip, code, sizeof(code))) {
+					std::string hex;
+					for (const auto byte: code) {
+						hex += fmt::format("{:02x} ", byte);
+					}
+					std::printf("ReadFaultDiag code 0x%" PRIx64 ": %s\n", rip, hex.c_str());
+				}
+			}
+		}
+		std::printf(
+		    "ReadFaultDiag t=%.3f thr='%s' rip=0x%" PRIx64 " path=%s off=0x%03" PRIx64
+		    " dirty=%d waittick=%" PRIu64 " cur=%" PRIu64 " gpu=%" PRIu64 " disp=%" PRIu64
+		    " | total %.1f sendsync %.1f dispatch %.1f gpu %.1f copy %.1f publish %.1f us"
+		    " | write age %.1f us tick %" PRIu64 " caller kyty+0x%" PRIx64
+		    " | labels after write %" PRIu64 ", first %s 0x%" PRIx64 "=0x%" PRIx64 " age %.1f us,"
+		    " last %s 0x%" PRIx64 "=0x%" PRIx64 " age %.1f us, newest any age %.1f us\n",
+		    us(m_fault.start_ns) / 1e6, thread, rip, m_path, m_fault.fault_vaddr - ReadFaultDiag::Page(),
+		    m_fault.byte_known ? (m_fault.byte_dirty ? 1 : 0) : -1, m_fault.wait_tick, m_current, m_gpu,
+		    m_dispatched, us(end - m_fault.start_ns), us(m_fault.sendsync_ns), us(m_fault.dispatch_ns),
+		    us(m_fault.gpu_ns), us(m_fault.copy_ns), us(publish), age(m_write_ns), m_write_tick,
+		    m_write_caller - std::min(m_write_caller, base), labels.count, labels.first.kind,
+		    labels.first.address, labels.first.value, age(labels.first.ns), labels.last.kind,
+		    labels.last.address, labels.last.value, age(labels.last.ns), age(labels.last_any_ns));
+	}
+	ReadFaultDiagScope(const ReadFaultDiagScope&)            = delete;
+	ReadFaultDiagScope& operator=(const ReadFaultDiagScope&) = delete;
+
+	void                  SetPath(const char* path) noexcept { m_path = path; }
+	ReadFaultDiag::Fault& Fault() noexcept { return m_fault; }
+
+private:
+	static uint32_t MaxLines() {
+		static const uint32_t lines = [] {
+			const auto* value = std::getenv("KYTY_READ_FAULT_DIAG_LINES");
+			return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 4000u;
+		}();
+		return lines;
+	}
+
+	ReadFaultDiag::Fault m_fault;
+	const char*          m_path         = "other";
+	uint64_t             m_write_ns     = 0;
+	uint64_t             m_write_tick   = 0;
+	uint64_t             m_write_caller = 0;
+	uint64_t             m_current      = 0;
+	uint64_t             m_gpu          = 0;
+	uint64_t             m_dispatched   = 0;
+};
+
+} // namespace
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool retried_write) {
+	std::optional<ReadFaultDiagScope> diag;
+	if (ReadFaultDiag::Covers(vaddr, size) && !is_write && !GuestGpu::IsGpuThread()) {
+		diag.emplace(vaddr, m_scheduler.GetMasterSemaphore());
+	}
+	// KYTY_READ_FAULT_DIAG=auto: the first slow guest read fault (after the load) chooses the page.
+	struct AutoChooser {
+		uint64_t vaddr = 0;
+		uint64_t start = 0;
+		~AutoChooser() {
+			if (start != 0 && ReadFaultDiag::NowNs() - start > 2'000'000) {
+				ReadFaultDiag::AutoChoose(vaddr);
+			}
+		}
+	} auto_chooser;
+	if (!diag && !is_write && ReadFaultDiag::AutoPending() && !GuestGpu::IsGpuThread() &&
+	    FaultCost::Frame() > 3000) {
+		auto_chooser.vaddr = vaddr;
+		auto_chooser.start = ReadFaultDiag::NowNs();
+	}
+	// KYTY_READ_FAULT_PUBLISHED: complete a guest load with the page's published bytes, or (verify)
+	// remember what it would have read and compare after the wait below.
+	struct PublishedVerify {
+		GuestLoad::Load load;
+		uint8_t         before[16] {};
+		uint32_t        frame = 0;
+		~PublishedVerify() {
+			uint8_t after[16] {};
+			if (!LibKernel::Memory::TryReadBacking(load.address, after, load.size)) {
+				return;
+			}
+			auto&      state = ReadFaultPublished();
+			const bool equal = std::memcmp(before, after, load.size) == 0;
+			(equal ? state.verify_equal : state.verify_different).fetch_add(1, std::memory_order_relaxed);
+			if (!equal && state.logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::string text;
+				for (uint32_t i = 0; i < load.size; i++) {
+					text += fmt::format("{:02x}{:02x} ", before[i], after[i]);
+				}
+				std::printf("Kyty read-fault published verify: 0x%" PRIx64 " (%u bytes) served/waited "
+				            "bytes differ: %s\n",
+				            load.address, load.size, text.c_str());
+			}
+		}
+	};
+	std::optional<PublishedVerify> published_verify;
+	if (const auto published_mode = g_read_fault_published.Get();
+	    published_mode != 0 && !is_write && GuestLoad::t_native_context != nullptr &&
+	    !GuestGpu::IsGpuThread()) {
+		auto&      state = ReadFaultPublished();
+		const auto frame = m_memory_tracker.Frame();
+		ReportReadFaultPublished(frame);
+		const auto      page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		GuestLoad::Load load;
+		uint8_t         bytes[16] {};
+		// A copy loop over the page would fault on every load: after a burst, wait (which
+		// publishes the page and makes it readable) instead.
+		thread_local uint64_t burst_page  = 0;
+		thread_local uint64_t burst_ns    = 0;
+		thread_local uint32_t burst_count = 0;
+		const auto            now_ns      = ReadFaultDiag::NowNs();
+		burst_count = burst_page == page && now_ns - burst_ns < 1'000'000 ? burst_count + 1 : 0;
+		burst_page  = page;
+		burst_ns    = now_ns;
+		if (burst_count >= 8) {
+			state.burst.fetch_add(1, std::memory_order_relaxed);
+		} else if (!GuestLoad::Decode(vaddr, load) ||
+		    Common::AlignDown(load.address + load.size - 1, TRACKER_PAGE_SIZE) != page) {
+			state.undecodable.fetch_add(1, std::memory_order_relaxed);
+		} else if (!IsRegionGpuModifiedRelaxed(page, TRACKER_PAGE_SIZE) ||
+		           m_texture_cache.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+			// Not (only) buffer bytes the GPU owns: an image's contents are not in the backing.
+			state.image.fetch_add(1, std::memory_order_relaxed);
+		} else if (!ReadFaultPublishedRecently(page, frame)) {
+			state.stale.fetch_add(1, std::memory_order_relaxed);
+		} else if (!LibKernel::Memory::TryReadBacking(load.address, bytes, load.size)) {
+			state.other.fetch_add(1, std::memory_order_relaxed);
+		} else if (published_mode == 2) {
+			published_verify.emplace();
+			published_verify->load  = load;
+			published_verify->frame = frame;
+			std::memcpy(published_verify->before, bytes, load.size);
+		} else if (GuestLoad::Apply(load, bytes)) {
+			state.served.fetch_add(1, std::memory_order_relaxed);
+			// Keep the page read-hot so its eager copy keeps publishing the GPU's new bytes.
+			(void)m_scheduler.Context().GetGpu().TrySendCommand(
+			    [this, page] { NoteEagerRead(page, TRACKER_PAGE_SIZE, false); });
+			if (diag) {
+				diag->SetPath("published");
+			}
+			return;
+		} else {
+			state.other.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	const auto diag_path = [&diag](const char* path) {
+		if (diag) {
+			diag->SetPath(path);
+		}
+	};
 	HangWatchdog::Scope       read("buffer-readback", vaddr, size, 0, 0, is_write);
 	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::ReadMemory);
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -1676,6 +2050,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		// A GPU-thread read continues below: bytes re-dirtied since that copy was issued still
 		// need their own readback before the caller reads.
 		if (side_path && !gpu_thread) {
+			diag_path(eager != 0 ? "pending-eager" : "pending-side");
 			// If a newer writer re-dirtied the page meanwhile it stays protected, and the
 			// retried access faults into a fresh readback.
 			if (eager == 0) {
@@ -1693,6 +2068,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		}
 	}
 	if (!side_path) {
+		diag_path("drain-nonside");
 		gpu.SendCommandSync([&, this, vaddr, size, is_write, gpu_thread] {
 			if (!is_write) {
 				NoteEagerRead(vaddr, size, gpu_thread);
@@ -1737,7 +2113,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 	}
 
 	std::shared_ptr<SideReadback> issued;
-	auto                          result = SideIssueResult::Other;
+	auto                          result    = SideIssueResult::Other;
+	const auto                    sync_mark = diag ? ReadFaultDiag::NowNs() : 0;
 	gpu.SendCommandSync([&, this, vaddr, size, is_write] {
 		if (!is_write) {
 			NoteEagerRead(vaddr, size, false);
@@ -1766,6 +2143,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			ReadMemoryDrain(vaddr, size, is_write, trace);
 		}
 	});
+	if (diag) {
+		diag->Fault().sendsync_ns = ReadFaultDiag::NowNs() - sync_mark;
+		switch (result) {
+			case SideIssueResult::Issued: diag_path("side-issued"); break;
+			case SideIssueResult::Pending: diag_path("pending-after-issue"); break;
+			case SideIssueResult::CurrentWriter: diag_path("drain-current-writer"); break;
+			case SideIssueResult::Unbounded: diag_path("drain-unbounded"); break;
+			case SideIssueResult::Other: diag_path("drain-other"); break;
+		}
+	}
 	switch (result) {
 		case SideIssueResult::Issued: {
 			// The GPU thread returned right after submitting; this guest thread waits.
@@ -2105,6 +2492,7 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	if (side_queue) {
 		producer = std::max(producer, m_unbounded_write_tick);
 	}
+	readback->producer = producer;
 	const auto                      master     = m_scheduler.GetMasterSemaphore().Handle();
 	const uint64_t                  wait_value = producer;
 	const vk::PipelineStageFlags    wait_stage = vk::PipelineStageFlagBits::eTransfer;
@@ -2173,10 +2561,85 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	return SideIssueResult::Issued;
 }
 
+// KYTY_READ_FAULT_DIAG: what a publication of the diagnosed page wrote (its first 16).
+static void DiagPrintPublication(const std::vector<GuestRange>& ranges, uint64_t begin, bool eager,
+                                 const uint8_t* staged) {
+	auto& state = ReadFaultDiag::Get();
+	if (state.publishes.fetch_add(1, std::memory_order_relaxed) >= 16) {
+		return;
+	}
+	const auto  page = ReadFaultDiag::Page();
+	std::string text;
+	uint64_t    bytes = 0;
+	for (const auto& range: ranges) {
+		const auto first = std::max(range.address, page);
+		const auto last  = std::min(range.address + range.size, page + ReadFaultDiag::RangeSize());
+		if (first >= last) {
+			continue;
+		}
+		bytes += last - first;
+		if (text.size() < 400) {
+			text += fmt::format(" +0x{:x}:{}", first - page, last - first);
+		}
+	}
+	std::string hex;
+	for (const auto& range: ranges) {
+		const auto first = std::max(range.address, page);
+		const auto last  = std::min(range.address + range.size, page + ReadFaultDiag::RangeSize());
+		for (auto a = first; a < last && hex.size() < 3 * 64; a++) {
+			hex += fmt::format("{:02x} ", staged[a - begin]);
+		}
+		if (!hex.empty()) {
+			break;
+		}
+	}
+	std::printf("ReadFaultDiag publish %s: %" PRIu64 " page bytes in%s | first bytes %s\n",
+	            eager ? "eager" : "side", bytes, text.c_str(), hex.c_str());
+}
+
 bool BufferCache::CompleteSideReadback(SideReadback& readback) {
 	HangWatchdog::Scope wait("readback-publication", readback.begin, readback.value, readback.end,
 	                         0, readback.eager);
 	HangWatchdog::DebugDelay("readback", readback.begin);
+	if (auto* diag = ReadFaultDiag::t_fault;
+	    diag != nullptr && !diag->waited && !readback.done.load(std::memory_order_acquire)) {
+		// KYTY_READ_FAULT_DIAG: split this reader's wait by polling each condition in turn.
+		diag->waited    = true;
+		auto&      master = m_scheduler.GetMasterSemaphore();
+		const auto tick   = readback.eager ? readback.value : readback.producer;
+		diag->wait_tick   = tick;
+		diag->byte_known  = true;
+		for (const auto& range: readback.ranges) {
+			diag->byte_dirty |= diag->fault_vaddr >= range.address &&
+			                    diag->fault_vaddr < range.address + range.size;
+		}
+		auto mark = ReadFaultDiag::NowNs();
+		const auto lap = [&](uint64_t& part) {
+			const auto now = ReadFaultDiag::NowNs();
+			part += now - mark;
+			mark = now;
+		};
+		if (const auto& progress = master.GetSubmissionProgress(); progress != nullptr) {
+			while (progress->dispatched_tick.load(std::memory_order_acquire) < tick &&
+			       !readback.done.load(std::memory_order_acquire)) {
+				std::this_thread::yield();
+			}
+		}
+		lap(diag->dispatch_ns);
+		while (!readback.done.load(std::memory_order_acquire)) {
+			master.Refresh();
+			if (master.KnownGpuTick() >= tick) {
+				break;
+			}
+			std::this_thread::yield();
+		}
+		lap(diag->gpu_ns);
+		if (!readback.eager && !readback.done.load(std::memory_order_acquire)) {
+			m_side->Wait(readback.value);
+		}
+		lap(diag->copy_ns);
+		diag->phases_end_ns = mark;
+	}
 	std::scoped_lock lock(readback.mutex);
 	if (readback.done.load(std::memory_order_acquire)) {
 		return false;
@@ -2201,6 +2664,12 @@ bool BufferCache::CompleteSideReadback(SideReadback& readback) {
 	for (const auto& range: readback.ranges) {
 		Libs::LibKernel::Memory::WriteBacking(range.address,
 		                                      staged + (range.address - readback.begin), range.size);
+	}
+	if (ReadFaultDiag::Covers(readback.begin, readback.end - readback.begin)) {
+		DiagPrintPublication(readback.ranges, readback.begin, readback.eager, staged);
+	}
+	if (g_read_fault_published.On()) {
+		NoteReadFaultPublication(readback.ranges, m_memory_tracker.Frame());
 	}
 	EndBackingPublication(readback.publication);
 	// Only pages whose pending mark survived lose GPU ownership: a newer recorded writer (or any
@@ -2300,6 +2769,8 @@ void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	m_write_ticks.Assign(vaddr, size, m_scheduler.CurrentTick());
+	ReadFaultDiag::NoteGpuWrite(vaddr, size, m_scheduler.CurrentTick(),
+	                            reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	if (m_write_ticks.Size() >= m_write_tick_prune_size) {
 		// Completed writers need no entry: their ranges read back as the prune floor.
 		const auto completed = m_scheduler.GetMasterSemaphore().KnownGpuTick();
@@ -2438,7 +2909,9 @@ EagerReadbackPages::IssueResult BufferCache::TryIssueEagerReadback(uint64_t page
 	// the queue, including all writers of these bytes (checked above to be submitted already).
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
-	const auto              native = command.Handle();
+	// Encoded with the recorder (no drain): the completion runner reads the staging only after
+	// this tick completed, which the recorder's submission of it precedes.
+	const auto              native = command.HelperSink();
 	vk::BufferMemoryBarrier before {};
 	before.srcAccessMask       = vk::AccessFlagBits::eMemoryWrite;
 	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
@@ -3029,6 +3502,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		}
 		return host_data + (copy.srcOffset - host_base);
 	};
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
@@ -3045,7 +3519,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			}
 			if (alias != nullptr) {
 				deferred->push_back({mapped + copy.srcOffset, static_cast<const uint8_t*>(alias),
-				                     copy.size});
+				                     copy.size, buffer.CpuAddress() + copy.dstOffset});
 			} else {
 				std::memcpy(mapped + copy.srcOffset, source_of(index, copy), copy.size);
 			}
@@ -3632,6 +4106,109 @@ std::pair<Buffer*, uint64_t> BufferCache::VerifyBindingHit(const BindingMemo&   
 	return fresh;
 }
 
+bool StreamCopyDefer::Enabled() {
+	static const bool enabled = ParseEnvU64("KYTY_STREAM_COPY_DEFER", 0) != 0;
+	return enabled;
+}
+
+void BufferCache::PruneDeferredCopies(const CommandRecorder& recorder) {
+	const auto consumed = recorder.RingConsumed();
+	while (m_deferred_head < m_deferred.size() && m_deferred[m_deferred_head].position <= consumed) {
+		m_deferred_head++;
+	}
+	if (m_deferred_head == m_deferred.size()) {
+		m_deferred.clear();
+		m_deferred_head = 0;
+		m_deferred_lo   = UINT64_MAX;
+		m_deferred_hi   = 0;
+	}
+}
+
+bool BufferCache::TryDeferStreamCopy(uint8_t* mapped, uint64_t vaddr, uint64_t size) {
+	if (!StreamCopyDefer::Enabled() || m_range_memo_verify != 0 || m_binding_memo_verify != 0 ||
+	    !m_stream_buffer.IsCoherent() || !CpCommit::Enabled(CpCommit::Part::StreamRead) ||
+	    !GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	const auto& command  = m_scheduler.Current();
+	auto*       recorder = command.Recorder();
+	if (recorder == nullptr || recorder->GetMode() != CommandRecorder::Mode::Thread) {
+		return false;
+	}
+	if (m_deferred_recorder != recorder) {
+		// A different recorder (never in practice): the pending copies of the old one drain first.
+		if (m_deferred_recorder != nullptr && !m_deferred.empty()) {
+			m_deferred_recorder->Drain(nullptr, false);
+		}
+		m_deferred.clear();
+		m_deferred_head     = 0;
+		m_deferred_lo       = UINT64_MAX;
+		m_deferred_hi       = 0;
+		m_deferred_recorder = recorder;
+	}
+	if (!CommandSink(command).hostCopy(mapped, vaddr, size)) {
+		return false; // a direct window: the recorder is drained, copy now
+	}
+	g_defer_cache = this;
+	PruneDeferredCopies(*recorder);
+	m_deferred.push_back({vaddr, vaddr + size, recorder->RingWritePosition()});
+	m_deferred_lo = std::min(m_deferred_lo, vaddr);
+	m_deferred_hi = std::max(m_deferred_hi, vaddr + size);
+	return true;
+}
+
+void StreamCopyDefer::NoteGpuOnlyWrite(uint64_t address, uint64_t size) {
+	if (auto* dma = g_write_drain_dma; dma != nullptr && size != 0 && UploadDmaWriteDrainEnabled() &&
+	                                   GuestGpu::IsGpuThread()) {
+		(void)dma->DrainHostCopies(address, size, false);
+	}
+	NoteGuestWriteStream(address, size);
+}
+
+void StreamCopyDefer::NoteGuestWrite(uint64_t address, uint64_t size) {
+	// KYTY_UPLOAD_DMA_WRITE_DRAIN (uploadDma.h): the guest may observe this write (a label) and
+	// then rewrite memory an earlier upload still has to read, so every queued host copy is made
+	// first.
+	if (auto* dma = g_write_drain_dma; dma != nullptr && size != 0 && UploadDmaWriteDrainEnabled() &&
+	                                   GuestGpu::IsGpuThread()) {
+		(void)dma->DrainHostCopies(address, size, true);
+	}
+	NoteGuestWriteStream(address, size);
+}
+
+void StreamCopyDefer::NoteGuestWriteStream(uint64_t address, uint64_t size) {
+	auto* cache = g_defer_cache;
+	if (cache == nullptr || cache->m_deferred.empty() || size == 0 || !GuestGpu::IsGpuThread()) {
+		return;
+	}
+	const auto end = address + size;
+	if (end <= cache->m_deferred_lo || address >= cache->m_deferred_hi) {
+		return;
+	}
+	auto* recorder = cache->m_deferred_recorder;
+	cache->PruneDeferredCopies(*recorder);
+	bool overlap = false;
+	for (size_t i = cache->m_deferred_head; i < cache->m_deferred.size() && !overlap; i++) {
+		const auto& copy = cache->m_deferred[i];
+		overlap          = address < copy.end && copy.begin < end;
+	}
+	if (!overlap) {
+		return;
+	}
+	static std::atomic<uint64_t> drains {0};
+	if (drains.fetch_add(1, std::memory_order_relaxed) < 8) {
+		std::printf("StreamCopyDefer: a CP write [0x%016" PRIx64 ", +0x%" PRIx64
+		            ") overlaps a pending stream copy: recorder drained\n",
+		            address, size);
+		std::fflush(stdout);
+	}
+	recorder->Drain(nullptr, false);
+	cache->m_deferred.clear();
+	cache->m_deferred_head = 0;
+	cache->m_deferred_lo   = UINT64_MAX;
+	cache->m_deferred_hi   = 0;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64_t size,
                                                           bool is_written, bool is_texel_buffer,
                                                           BufferId id, BufferId* obtained) {
@@ -3708,12 +4285,18 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 			if (mapped != nullptr && StreamDirectReadEnabled()) {
 				std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
 				read = true;
+			} else if (mapped != nullptr && TryDeferStreamCopy(mapped, vaddr, size)) {
+				read = true; // KYTY_STREAM_COPY_DEFER: the recorder copies the bytes
 			} else if (mapped != nullptr) {
 				// KYTY_CP_COMMIT=streamread: the reservation is committed only after a successful
 				// read, so the direct read may leave partial bytes in it when it fails.
+				const uint64_t probe_t0 = StreamCopyProbe() ? __rdtsc() : 0;
 				read = CpCommit::Enabled(CpCommit::Part::StreamRead)
 				           ? Libs::LibKernel::Memory::TryReadBackingDirect(vaddr, mapped, size)
 				           : Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size);
+				if (probe_t0 != 0) {
+					StreamCopyProbeAdd(size, __rdtsc() - probe_t0, vaddr);
+				}
 			}
 			if (read) {
 				m_stream_buffer.Commit();
@@ -3793,9 +4376,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainWrittenBuffer(uint64_t vaddr, ui
 std::pair<Buffer*, uint64_t> BufferCache::ObtainImageStagingBuffer(uint64_t size) {
 	auto [mapped, offset] = m_staging_buffer.Map(size, 16);
 	if (mapped != nullptr) return {&m_staging_buffer, offset};
-	if (!SmallUploadRingEnabled()) return {nullptr, 0};
-	// The fixed ring must not impose a maximum guest image size. Keep this one-off source
-	// alive until the submission using it has completed, as UploadCopies does for buffers.
+	// The ring (fixed small ring or the default one) must not impose a maximum guest image size
+	// (upstream 9bcf80bf6: a 576 MiB image exceeded the default 512 MiB ring). Keep this one-off
+	// source alive until the submission using it has completed, as UploadCopies does for buffers.
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                         AllFlags, size);
 	auto* source = temporary.get();
@@ -4062,6 +4645,13 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
 	if (dst_memory && preserve_images) {
 		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
+	}
+	if (src_memory && src->is_deleted) {
+		// Obtaining the destination created a buffer that joined (and deleted) the source's. The
+		// deleted buffer is freed once the current tick completes, and that synchronization may
+		// already have submitted the tick the join was recorded in: copy from the joined buffer.
+		std::tie(src, src_offset) = ObtainBuffer(src_vaddr, size, false, true, BufferId {});
+		EXIT_IF(src->is_deleted);
 	}
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
@@ -4489,6 +5079,7 @@ void BufferCache::RunGarbageCollector() {
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
 		}
 		return ++retire_count == limit;
 	});

@@ -4,8 +4,11 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <array>
 #include <optional>
+#include <string>
 #include <bit>
 #include <unordered_map>
 #include <utility>
@@ -233,13 +236,6 @@ IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type
 		if (type == IR::Type::F64) {
 			if (operand.kind == Decoder::OperandKind::LiteralConstant) {
 				pair = {IR::U32(IR::Value(0u)), IR::U32(IR::Value(operand.value))};
-			} else if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-				const auto bits = operand.value == 0x3e22f983u
-				                      ? 0x3fc45f306dc9c882ull
-				                      : std::bit_cast<uint64_t>(static_cast<double>(
-				                            std::bit_cast<float>(operand.value)));
-				pair            = {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
-				                   IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
 			}
 			if (operand.absolute) {
 				pair[1] = ir.BitwiseAnd(pair[1], IR::U32(IR::Value(0x7fffffffu)));
@@ -481,6 +477,14 @@ std::array<IR::U32, 2> Translator::ReadU32Pair(const Decoder::Operand& operand) 
 	if (operand.kind == Decoder::OperandKind::VccLo) {
 		return {ir.GetVccLo(), ir.GetVccHi()};
 	}
+	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+		const auto bits =
+		    operand.value == 0x3e22f983u
+		        ? 0x3fc45f306dc9c882ull
+		        : std::bit_cast<uint64_t>(static_cast<double>(std::bit_cast<float>(operand.value)));
+		return {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
+		        IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
+	}
 	const auto low = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
 	IR::U32    high(IR::Value(0u));
 	if (operand.kind == Decoder::OperandKind::Sgpr || operand.kind == Decoder::OperandKind::Vgpr) {
@@ -539,9 +543,11 @@ IR::U32 Translator::Read16LaneBits(const Decoder::Operand& operand, bool high_la
 	auto bits             = ReadRawU32(operand);
 	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
 		// Inline floats encode the operand's width before SDWA or OP_SEL selects bits.
-		const auto half      = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {ir.BitCastF32(bits)}));
-		const auto half_bits = IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {half}));
-		bits                = IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {half_bits}));
+		const auto value = operand.value;
+		bits             = IR::U32(IR::Value(value == 0x3e22f983u
+		                                         ? 0x3118u
+		                                         : ((value >> 16u) & 0x8000u) |
+		                                               ((((value >> 23u) & 0xffu) - 112u) << 10u)));
 	}
 	bits = ApplyBitSourceModifiers(raw_operand, bits);
 	uint32_t offset = (high_lane ? operand.op_sel_hi : operand.op_sel) ? 16u : 0u;
@@ -875,30 +881,70 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		case Decoder::Opcode::V_FLOOR_F64:
 		case Decoder::Opcode::V_FRACT_F64: include_vector(inst.dst, 2u); [[fallthrough]];
 		case Decoder::Opcode::V_CVT_F32_F64: include_vector(inst.src0, 2u); break;
+		case Decoder::Opcode::V_CMP_F_F64:
+		case Decoder::Opcode::V_CMP_LT_F64:
 		case Decoder::Opcode::V_CMP_EQ_F64:
 		case Decoder::Opcode::V_CMP_LE_F64:
+		case Decoder::Opcode::V_CMP_GT_F64:
+		case Decoder::Opcode::V_CMP_LG_F64:
+		case Decoder::Opcode::V_CMP_GE_F64:
+		case Decoder::Opcode::V_CMP_O_F64:
+		case Decoder::Opcode::V_CMP_U_F64:
+		case Decoder::Opcode::V_CMP_NGE_F64:
+		case Decoder::Opcode::V_CMP_NLG_F64:
+		case Decoder::Opcode::V_CMP_NGT_F64:
+		case Decoder::Opcode::V_CMP_NLE_F64:
+		case Decoder::Opcode::V_CMP_NEQ_F64:
+		case Decoder::Opcode::V_CMP_NLT_F64:
+		case Decoder::Opcode::V_CMP_TRU_F64:
+		case Decoder::Opcode::V_CMPX_F_F64:
+		case Decoder::Opcode::V_CMPX_LT_F64:
+		case Decoder::Opcode::V_CMPX_EQ_F64:
 		case Decoder::Opcode::V_CMPX_LE_F64:
+		case Decoder::Opcode::V_CMPX_GT_F64:
+		case Decoder::Opcode::V_CMPX_LG_F64:
 		case Decoder::Opcode::V_CMPX_GE_F64:
-		case Decoder::Opcode::V_CMP_EQ_I64:
+		case Decoder::Opcode::V_CMPX_O_F64:
+		case Decoder::Opcode::V_CMPX_U_F64:
+		case Decoder::Opcode::V_CMPX_NGE_F64:
+		case Decoder::Opcode::V_CMPX_NLG_F64:
+		case Decoder::Opcode::V_CMPX_NGT_F64:
+		case Decoder::Opcode::V_CMPX_NLE_F64:
+		case Decoder::Opcode::V_CMPX_NEQ_F64:
+		case Decoder::Opcode::V_CMPX_NLT_F64:
+		case Decoder::Opcode::V_CMPX_TRU_F64:
+		case Decoder::Opcode::V_CMP_F_I64:
 		case Decoder::Opcode::V_CMP_LT_I64:
+		case Decoder::Opcode::V_CMP_EQ_I64:
 		case Decoder::Opcode::V_CMP_LE_I64:
+		case Decoder::Opcode::V_CMP_GT_I64:
 		case Decoder::Opcode::V_CMP_NE_I64:
+		case Decoder::Opcode::V_CMP_GE_I64:
+		case Decoder::Opcode::V_CMP_T_I64:
+		case Decoder::Opcode::V_CMP_F_U64:
 		case Decoder::Opcode::V_CMP_LT_U64:
 		case Decoder::Opcode::V_CMP_EQ_U64:
 		case Decoder::Opcode::V_CMP_LE_U64:
 		case Decoder::Opcode::V_CMP_GT_U64:
 		case Decoder::Opcode::V_CMP_NE_U64:
 		case Decoder::Opcode::V_CMP_GE_U64:
+		case Decoder::Opcode::V_CMP_T_U64:
+		case Decoder::Opcode::V_CMPX_F_I64:
 		case Decoder::Opcode::V_CMPX_LT_I64:
 		case Decoder::Opcode::V_CMPX_EQ_I64:
 		case Decoder::Opcode::V_CMPX_LE_I64:
+		case Decoder::Opcode::V_CMPX_GT_I64:
 		case Decoder::Opcode::V_CMPX_NE_I64:
+		case Decoder::Opcode::V_CMPX_GE_I64:
+		case Decoder::Opcode::V_CMPX_T_I64:
+		case Decoder::Opcode::V_CMPX_F_U64:
 		case Decoder::Opcode::V_CMPX_LT_U64:
 		case Decoder::Opcode::V_CMPX_EQ_U64:
 		case Decoder::Opcode::V_CMPX_LE_U64:
 		case Decoder::Opcode::V_CMPX_GT_U64:
 		case Decoder::Opcode::V_CMPX_NE_U64:
 		case Decoder::Opcode::V_CMPX_GE_U64:
+		case Decoder::Opcode::V_CMPX_T_U64:
 			include_vector(inst.src0, 2u);
 			include_vector(inst.src1, 2u);
 			break;
@@ -908,9 +954,14 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		switch (inst.opcode) {
 			case Decoder::Opcode::DS_ADD_U64:
 			case Decoder::Opcode::DS_OR_B64:
+			case Decoder::Opcode::DS_MAX_RTN_U64:
 			case Decoder::Opcode::DS_WRITE_B64:
 			case Decoder::Opcode::DS_WRITE_B96:
 			case Decoder::Opcode::DS_WRITE_B128: include_vector(inst.src1, inst.data_dwords); break;
+			case Decoder::Opcode::DS_CMPST_RTN_B64:
+				include_vector(inst.src1, 2u);
+				include_vector(inst.src2, 2u);
+				break;
 			case Decoder::Opcode::DS_WRITE2_B32:
 			case Decoder::Opcode::DS_WRITE2ST64_B32:
 			case Decoder::Opcode::DS_WRITE2_B64:
@@ -983,6 +1034,64 @@ bool StartsWithLiveExec(const Decoder::Program& decoded, const TranslateOptions&
 	return false;
 }
 
+// KYTY_TRANSLATE_STATS=1 (diagnostic, default off): one stdout line per translated program, for
+// sizing codegen work over a run's whole shader set (with KYTY_PROGRAM_CACHE=0 and
+// KYTY_SHADER_PRECOMPILE=1 every journaled program is translated at start-up):
+//   TranslateStats: stage=<ShaderType> wave=<32|64> hash=0x.. insts=N
+//   mode=structured|dispatcher(kind) setpc=N movrel=N pk_f16=N f16=N mix_f16=N
+// pk_f16: V_PK_{ADD,MUL,MIN,MAX,FMA,FMAC}_F16 (lowered to two f32 operations each); f16: other
+// half-precision arithmetic (unpacked VOP1/VOP2/VOP3 F16 forms); mix_f16: V_MAD_MIX*/V_FMA_MIX*.
+bool TranslateStatsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TRANSLATE_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void PrintTranslateStats(const Decoder::Program& decoded, const CFG::Graph& cfg,
+                         const TranslateOptions& options) {
+	using O = Decoder::Opcode;
+	uint32_t setpc = 0, movrel = 0, pk_f16 = 0, f16 = 0, mix = 0;
+	for (const auto& inst: decoded.instructions) {
+		switch (inst.opcode) {
+			case O::S_SETPC_B64: setpc++; break;
+			case O::V_MOVRELS_B32:
+			case O::V_MOVRELD_B32: movrel++; break;
+			case O::V_PK_ADD_F16:
+			case O::V_PK_MUL_F16:
+			case O::V_PK_MIN_F16:
+			case O::V_PK_MAX_F16:
+			case O::V_PK_FMA_F16:
+			case O::V_PK_FMAC_F16: pk_f16++; break;
+			case O::V_MAD_MIXLO_F16:
+			case O::V_MAD_MIXHI_F16: mix++; break;
+			case O::V_ADD_F16:
+			case O::V_SUB_F16:
+			case O::V_SUBREV_F16:
+			case O::V_MUL_F16:
+			case O::V_FMAC_F16:
+			case O::V_FMAMK_F16:
+			case O::V_FMAAK_F16:
+			case O::V_FMA_F16:
+			case O::V_MIN3_F16:
+			case O::V_MAX3_F16:
+			case O::V_MED3_F16:
+			case O::V_MAX_F16:
+			case O::V_MIN_F16: f16++; break;
+			default: break;
+		}
+	}
+	const bool dispatcher = cfg.irreducible || cfg.unsupported;
+	std::printf("TranslateStats: stage=%u wave=%u hash=0x%016llx insts=%zu mode=%s(%u) setpc=%u movrel=%u "
+	            "pk_f16=%u f16=%u mix_f16=%u%s%s\n",
+	            static_cast<uint32_t>(options.stage), static_cast<uint32_t>(options.wave_size),
+	            static_cast<unsigned long long>(options.shader_hash),
+	            decoded.instructions.size(), dispatcher ? "dispatcher" : "structured",
+	            static_cast<uint32_t>(cfg.failure_kind), setpc, movrel, pk_f16, f16, mix,
+	            cfg.unsupported_reason.empty() ? "" : " reason=", cfg.unsupported_reason.c_str());
+}
+
 } // namespace
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
@@ -995,6 +1104,21 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	IR::Program result;
 	result.stage               = options.stage;
 	result.wave_size           = options.wave_size;
+	if (options.stage == ShaderType::Compute && options.wave_size == 64u &&
+	    GetCodegenOptions().lane_local && GetHostComputeSubgroups32() && options.input_info.compute != nullptr &&
+	    options.input_info.compute->host_subgroup_size == 32u) {
+		// KYTY_LANE_LOCAL (CodegenOptions.h): one guest lane per host invocation when proven.
+		static const bool log = std::getenv("KYTY_LANE_LOCAL_LOG") != nullptr;
+		std::string       reason;
+		bool              uniform_loads = false;
+		result.lane_local = IsWaveLaneLocal(decoded, log ? &reason : nullptr, &uniform_loads) &&
+		                    !uniform_loads;
+		if (log) {
+			std::printf("LaneLocal CS %016llx: %s\n",
+			            static_cast<unsigned long long>(options.shader_hash),
+			            result.lane_local ? "yes" : uniform_loads ? "uniform loads only" : reason.c_str());
+		}
+	}
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
 	result.user_data_count     = options.user_data_count;
@@ -1101,7 +1225,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			total_threads = std::max(workgroup->threads_num[0], 1u) *
 			                std::max(workgroup->threads_num[1], 1u) *
 			                std::max(workgroup->threads_num[2], 1u);
-			if (options.wave_size == 64u && workgroup->host_subgroup_size == 32u &&
+			if (options.wave_size == 64u && workgroup->host_subgroup_size == 32u && !result.lane_local &&
 			    total_threads % 64u != 0u) {
 				initial_exec = entry_ir.ULessThan(builtin(IR::StageInputKind::LocalInvocationIndex),
 				                                  IR::U32(IR::Value(total_threads)));
@@ -1123,9 +1247,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		entry_ir.SetExec(initial_exec);
 		const auto initial_mask = entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});
-		entry_ir.SetExecLo(entry_ir.CompositeExtract(initial_mask, 0));
-		entry_ir.SetExecHi(options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
-		                                            : IR::U32(IR::Value(0u)));
+		const auto initial_lo = entry_ir.CompositeExtract(initial_mask, 0);
+		const auto initial_hi = options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
+		                                               : IR::U32(IR::Value(0u));
+		entry_ir.SetExecLo(initial_lo);
+		entry_ir.SetExecHi(initial_hi);
 		if (options.stage == ShaderType::Compute) {
 			const auto* cs = options.input_info.compute;
 			const auto  thread_ids =
@@ -1348,11 +1474,16 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Vertex) {
 			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave.
-			// Keep its full lane extent: mbcnt(-1) uses lane ordinals, not active counts.
+			// ESVertCount describes input vertices, independently of lane ordinals.
+			auto vertex_count = IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {initial_lo}));
+			if (options.wave_size == 64u) {
+				vertex_count = entry_ir.IAdd(vertex_count, IR::U32(entry_ir.Emit(
+				    IR::ValueOpcode::BitCount32, {initial_hi})));
+			}
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
-			                      IR::U32(IR::Value((1u << 28u) | options.wave_size)));
+			                      entry_ir.BitwiseOr(vertex_count, IR::U32(IR::Value(1u << 28u))));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			// The instance ID counts from 0; the start instance is Vulkan's base instance.
@@ -1370,7 +1501,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	bool lds_write_pending = false;
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
-		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);
+		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs,
+		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute);
 		// Blocks are visited in address order; keep unordered LDS writes pending across
 		// fallthrough splits so a later S_WAITCNT lgkmcnt(0) still orders them.
 		translator.SetLdsWritePending(lds_write_pending);
@@ -1401,6 +1533,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	}
 	if (IR::ValidationEnabled()) {
 		IR::ValidateProgram(result, false);
+	}
+	if (TranslateStatsEnabled()) [[unlikely]] {
+		PrintTranslateStats(decoded, cfg, options);
 	}
 	return result;
 }

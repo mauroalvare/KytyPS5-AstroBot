@@ -51,6 +51,65 @@ bool SpecializationFail(std::string_view message) {
 	return false;
 }
 
+// KYTY_SPEC_UNMAPPED_NULL (default on; =0 off): a buffer V# the renderer would bind as empty
+// (base 0, no records, or a base outside every guest mapping: FindBuffers' ClampRangeSizeQuiet)
+// specializes as the null descriptor, as a V# with a non-zero type does. Its stride, swizzle,
+// ADD_TID and format bits cannot change what the shader reads (nothing) or writes (dropped), so
+// the garbage words a game leaves in a descriptor slot it only uses on a branch it does not take
+// no longer compile a new permutation per value (Astro Bot's [Performance] patches: a vertex
+// shader's atomic V# gave ~80 permutations in minutes). The probe answers exactly the binding's
+// question (is the base mapped), so a V# with a mapped base is never nulled. The decision is made
+// per materialization from the current words: the same slot holding a real V# later specializes
+// normally (a different key, so the null permutation is not reused for it).
+std::atomic<SrtMappedRange> g_unmapped_buffer_probe {nullptr};
+std::atomic<uint64_t>       g_unmapped_buffer_nulls {0};
+
+thread_local std::array<uint64_t, 16> t_mapped_blocks {}; // 64 KiB blocks seen mapped (+1)
+
+bool BufferBaseMapped(SrtMappedRange probe, uint64_t base, uint64_t size) {
+	const auto block = (base >> 16u) + 1u;
+	auto&      slot  = t_mapped_blocks[block & (t_mapped_blocks.size() - 1u)];
+	if (slot == block) {
+		return true;
+	}
+	if (!probe(base, size)) {
+		return false;
+	}
+	slot = block; // only positive verdicts are cached: a stale one keeps the V# (old behaviour)
+	return true;
+}
+
+// Whether the buffer descriptor must specialize (and bind) as null.
+bool NullBufferDescriptor(const ShaderBufferResource& descriptor, bool count = true) {
+	if (descriptor.Type() != 0) {
+		return true;
+	}
+	const auto probe = g_unmapped_buffer_probe.load(std::memory_order_relaxed);
+	if (probe == nullptr) {
+		return false;
+	}
+	const uint64_t base = descriptor.Base48();
+	const uint64_t size = descriptor.GetSize();
+	if (base != 0u && size != 0u && BufferBaseMapped(probe, base, size)) {
+		return false;
+	}
+	if ((descriptor.fields[0] | descriptor.fields[1] | descriptor.fields[2] | descriptor.fields[3]) == 0u) {
+		return false; // already the null descriptor
+	}
+	if (!count) {
+		return true;
+	}
+	const auto nulls = g_unmapped_buffer_nulls.fetch_add(1, std::memory_order_relaxed);
+	if (nulls < 8u) {
+		std::fprintf(stderr,
+		             "Kyty spec: buffer V# with unmapped base 0x%012" PRIx64
+		             " specialized as null (%08x %08x %08x %08x)%s\n",
+		             base, descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+		             descriptor.fields[3], nulls == 7u ? "; further ones are counted only" : "");
+	}
+	return true;
+}
+
 Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
                                             Decoder::ImageDimension requested) {
 	const bool is_array = requested == Decoder::ImageDimension::Dim1DArray ||
@@ -109,6 +168,7 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	    type != Prospero::ImageType::kColor2DMsaa) {
 		return false;
 	}
+	if (!IsValidImageSwizzle(words[3] & 0xfffu)) return false;
 	const bool array = type == Prospero::ImageType::kColor1DArray ||
 	                   type == Prospero::ImageType::kColor2DArray ||
 	                   type == Prospero::ImageType::kColor2DMsaaArray ||
@@ -116,15 +176,15 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	if (array && ((words[4] >> 16u) & 0x1fffu) > (words[4] & 0x1fffu)) {
 		return false;
 	}
+	const auto base_level = (words[3] >> 12u) & 0xfu;
+	const auto last_level = (words[3] >> 16u) & 0xfu;
 	if (type == Prospero::ImageType::kColor2DMsaa ||
 	    type == Prospero::ImageType::kColor2DMsaaArray) {
-		const auto base_level = (descriptor.dwords[3] >> 12u) & 0xfu;
-		const auto fragments  = (descriptor.dwords[3] >> 16u) & 0xfu;
 		const auto max_mip    = (descriptor.dwords[5] >> 4u) & 0xfu;
-		return base_level == 0 && fragments >= 1 && fragments <= 3 &&
-		       (r128 || max_mip == fragments);
+		return base_level == 0 && last_level >= 1 && last_level <= 3 &&
+		       (r128 || max_mip == last_level);
 	}
-	return true;
+	return base_level <= last_level;
 }
 
 // A null image keeps the draw alive, but the walk read something that is not a descriptor (all-zero
@@ -180,6 +240,8 @@ uint32_t ImageMipCount(const ImageResource& image, const DescriptorValue& descri
 	}
 	const auto base = (descriptor.dwords[3] >> 12u) & 0xfu;
 	const auto last = (descriptor.dwords[3] >> 16u) & 0xfu;
+	// Validated descriptors (ValidImageDescriptor) never have base > last; descriptors that reach
+	// specialization without that check still fail it below instead of wrapping around.
 	return base <= last ? last - base + 1u : 0u;
 }
 
@@ -571,13 +633,21 @@ private:
 template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan);
 
+void SetUnmappedBufferProbe(SrtMappedRange probe) {
+	g_unmapped_buffer_probe.store(probe, std::memory_order_relaxed);
+}
+
+uint64_t UnmappedBufferNulls() {
+	return g_unmapped_buffer_nulls.load(std::memory_order_relaxed);
+}
+
 static bool SpecializeBuffer(const BufferResource& buffer, DescriptorValue& descriptor_value,
                              ResourceSpecialization& specialization, uint32_t i) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(descriptor_value, descriptor)) {
 		return SpecializationFail(fmt::format("buffer descriptor {} has invalid width", i));
 	}
-	if (descriptor.Type() != 0) {
+	if (NullBufferDescriptor(descriptor)) {
 		descriptor_value.dwords.fill(0);
 		descriptor = {};
 	}
@@ -650,6 +720,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (base.atomic &&
 		    (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt
 		                   : format != Prospero::BufferFormat::k32UInt &&
+		                         format != Prospero::BufferFormat::k32SInt &&
 		                         format != Prospero::BufferFormat::k32Float)) {
 			return SpecializationFail(
 			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
@@ -670,7 +741,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
-		                              base.written && !base.read && !base.atomic;
+		                              base.written && (base.atomic ? !base.atomic64 : !base.read);
 		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
@@ -1275,8 +1346,15 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 				const auto& buffer = program.info.buffers[i];
 				if (!buffer.written || (!active.empty() && !active[buffer.source])) continue;
 				DescriptorValue strict;
-				if (!clean.EvaluateDescriptor(buffer.source, strict) ||
-				    strict != snapshot.buffers[i]) return false;
+				if (!clean.EvaluateDescriptor(buffer.source, strict)) return false;
+				if (fuse_buffers) {
+					// SpecializeBuffer nulled the snapshot's copy the same way.
+					ShaderBufferResource decoded;
+					if (DecodeBufferDescriptor(strict, decoded) && NullBufferDescriptor(decoded, false)) {
+						strict.dwords.fill(0);
+					}
+				}
+				if (strict != snapshot.buffers[i]) return false;
 			}
 		}
 	}
@@ -1503,14 +1581,23 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 					if (memory.formatted && !memory.typed) {
 						const auto& buffer = buffers[memory.resource];
 						const auto format = Format::GetFormatInfo(buffer.descriptor_format);
-						for (uint32_t component = 0; component < count; component++) {
+						const bool d16 = memory.data_bits == 16u;
+						const auto components = d16 ? memory.component_count : count;
+						std::array<uint32_t, 4> constants {};
+						for (uint32_t component = 0; component < components; component++) {
 							if (format.type == Format::ComponentType::Unknown ||
 							    GetDstSel(buffer.descriptor_swizzle, component) != 1u) continue;
-							const auto one = Format::FormattedConstantBits(
+							auto one = Format::FormattedConstantBits(
 							    format, Format::FormattedSourceKind::One);
+							if (d16 && one == 0x3f800000u) one = 0x3c00u;
+							constants[d16 ? component / 2u : component] |=
+							    one << (d16 ? (component % 2u) * 16u : 0u);
+						}
+						for (uint32_t component = 0; component < count; component++) {
+							if (constants[component] == 0u) continue;
 							values[component] = Value(&*block->PrependNewInst(
 							    it, ValueOpcode::SelectU32,
-							    {inst.Arg(inst.NumArgs() - 1), Value(one), Value(0u)}));
+							    {inst.Arg(inst.NumArgs() - 1), Value(constants[component]), Value(0u)}));
 						}
 					}
 					Value result = values[0];

@@ -29,6 +29,7 @@ _Textures/
 *.pdb
 *.nsys-rep
 *.ngfx-gputrace
+CMakeUserPresets.json
 
 # Local Astro testing data must never enter source or release assets.
 _SaveData/
@@ -39,6 +40,7 @@ _Textures/
 _kyty.txt
 *.profraw
 *.profdata
+!tools/pgo/*.profdata
 tools/astro-bot/runtime/
 tools/astro-bot/local-config.json
 tools/astro-bot/logs/
