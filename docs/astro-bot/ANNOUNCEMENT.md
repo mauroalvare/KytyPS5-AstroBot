@@ -7,7 +7,7 @@ Avoid unrelated issues, duplicate reports and unsolicited mass mentions.
 
 ## Copyable English announcement
 
-> I am sharing an unofficial Astro Bot testing fork based on KytyPS5 and Jetsku U59 int19.1:
+> I am sharing an unofficial Astro Bot testing fork based on KytyPS5 and Jetsku U59 int21:
 > https://github.com/mauroalvare/KytyPS5-AstroBot
 >
 > The Windows preview reaches gameplay with PPSA21564 v01.007.000 and includes English

@@ -15,6 +15,10 @@ Current status: **In game on one Windows PC; performance and compatibility remai
 - Measure deferred GI, tessellation and occlusion separately before recommending them.
 - Test new areas, level transitions, save/load and longer sessions for crashes.
 - Validate source builds on Windows and Linux before proposing changes upstream.
+- Play-test the int21 kit against the previous int19.1 kit in the same scenes.
+- Pin the v01.007.000 command buffer table offset once `-CommandBufferScale` logs it, and
+  check whether busy levels still hit the "too many objects/batches" crash.
+- Port the ~217 newer upstream KytyPS5 commits that conflict with U59, one at a time.
 
 ## Explicit limits
 

@@ -70,6 +70,28 @@ synchronization tests. The current revision has newer guards and CPU checks and 
 needs those GPU tests repeated. No linked full source build, Linux runtime, complete
 playthrough, stable 60 FPS, correct 90/120 game speed or native HDR is claimed.
 
+## November 2026 update
+
+Checks for the move to U59 int21 and the upstream cherry-picks. None of them starts the
+game, a GPU device or a controller.
+
+- `kyty_emulator` and the test targets build with clang-cl 19.1.5 (Visual Studio 2022
+  Build Tools, Release, launcher off).
+- 21 unit tests pass: range_set, page_manager, memory_tracker, audio_out2_port,
+  pad_haptics, controller_settings, lru_cache, u59_preset, game_patch_filter (including
+  the new command buffer table checks), jpeg_dec, jpeg_enc, ngs2_sampler, save_data_memory,
+  event_queue_lifetime, image_page_table, shader_cfg and five virtual_memory_allocation
+  variants.
+- The kit passes 33 standalone checks and 36 with the verified int21 archive: setup
+  extracts it, checks the executable hash and produces the exact pinned rumble copy.
+- The int21 rumble gate was located by disassembly: the same `cmp eax,6; je` after
+  `SDL_GetGamepadTypeForID` in the haptics queue, followed by `SDL_RumbleGamepad(..., 100)`.
+  The four guard sequences are checked before the six bytes change.
+- The frame layer's 3 CPU suites pass.
+
+Not yet done: an Astro Bot play session with the int21 kit or a source build, and a
+`-CommandBufferScale` run on v01.007.000.
+
 ## Repeating a useful performance test
 
 1. Record OS, CPU, GPU/driver, RAM/VRAM, game version/hash, exact commit/kit and profile.
