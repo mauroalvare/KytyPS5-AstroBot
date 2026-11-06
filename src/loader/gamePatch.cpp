@@ -11,6 +11,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -346,36 +347,76 @@ void ApplyBuiltin(Program* main_program) {
 	// behind (game threads short of CPU, or blocked on reads of GPU-written memory), one buffer
 	// takes two frames' work: 11.4-12.1 MiB, measured flat at that ceiling also with the game on
 	// 16 logical processors. The table is scaled before the game runs.
-	int scale = 2;
-	if (const auto* value = std::getenv("KYTY_ASTRO_CB_SCALE"); value != nullptr) {
-		scale = std::clamp(std::atoi(value), 1, 4);
-	}
-	if (scale == 1) {
+	//
+	// Other Astro Bot builds (IsAstroBotTitle, e.g. PPSA21564 01.007.000 of tools/astro-bot) have
+	// no verified table address. Setting KYTY_ASTRO_CB_SCALE explicitly opts them in to a scan of
+	// the writable LOAD segments for the same five sizes; the table is scaled only when exactly one
+	// copy exists, and the log names its offset so a report can pin it for that build.
+	const auto option = ParseAstroCbScale(std::getenv("KYTY_ASTRO_CB_SCALE"));
+	if (option.scale == 1) {
 		return;
 	}
 	std::string title_id;
 	std::string version;
 	if (!SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
-	    !SystemContentParamSfoGetString("APP_VER", &version) || title_id != "PPSA21567" ||
-	    version != "01.018.000") {
+	    !SystemContentParamSfoGetString("APP_VER", &version) || !IsAstroBotTitle(title_id)) {
 		return;
 	}
-	static constexpr uint64_t kTable     = 0x8491510;
-	static constexpr uint32_t kSizes[5]  = {7, 7, 4, 4, 6};
-	const auto                address    = main_program->base_vaddr + kTable;
-	if (!IsInsideProgram(*main_program, address, sizeof(kSizes)) ||
-	    std::memcmp(reinterpret_cast<const void*>(address), kSizes, sizeof(kSizes)) != 0) {
-		::printf("Game patch: Astro Bot command buffer table not found (KYTY_ASTRO_CB_SCALE)\n");
+	const bool verified_build = title_id == "PPSA21567" && version == "01.018.000";
+	if (!verified_build && !option.explicit_value) {
 		return;
+	}
+	uint64_t address = 0;
+	if (verified_build) {
+		static constexpr uint64_t kTable = 0x8491510;
+		address                          = main_program->base_vaddr + kTable;
+		if (!IsInsideProgram(*main_program, address, sizeof(kAstroCbSizes)) ||
+		    std::memcmp(reinterpret_cast<const void*>(address), kAstroCbSizes,
+		                sizeof(kAstroCbSizes)) != 0) {
+			::printf("Game patch: Astro Bot command buffer table not found (KYTY_ASTRO_CB_SCALE)\n");
+			return;
+		}
+	} else {
+		size_t      matches = 0;
+		const auto* ehdr    = main_program->elf->GetEhdr();
+		const auto* phdr    = main_program->elf->GetPhdr();
+		for (Elf64_Half index = 0; index < ehdr->e_phnum && matches < 2; index++) {
+			const auto& segment = phdr[index];
+			if (segment.p_type != PT_LOAD || (segment.p_flags & PF_W) == 0) {
+				continue;
+			}
+			const auto* begin =
+			    reinterpret_cast<const uint8_t*>(main_program->base_vaddr + segment.p_vaddr);
+			if (!IsInsideProgram(*main_program, reinterpret_cast<uint64_t>(begin),
+			                     segment.p_filesz)) {
+				continue;
+			}
+			size_t     first = 0;
+			const auto found = CountOccurrences(begin, segment.p_filesz, kAstroCbSizes,
+			                                    sizeof(kAstroCbSizes), 2 - matches, &first);
+			if (found != 0 && matches == 0) {
+				address = reinterpret_cast<uint64_t>(begin) + first;
+			}
+			matches += found;
+		}
+		if (matches != 1) {
+			::printf("Game patch: Astro Bot %s %s command buffer table %s; not scaled "
+			         "(KYTY_ASTRO_CB_SCALE)\n",
+			         title_id.c_str(), version.c_str(), matches == 0 ? "not found" : "ambiguous");
+			return;
+		}
+		::printf("Game patch: Astro Bot %s %s command buffer table found by signature at +0x%" PRIx64
+		         " (unverified build)\n",
+		         title_id.c_str(), version.c_str(), address - main_program->base_vaddr);
 	}
 	uint32_t scaled[5] {};
 	for (int i = 0; i < 5; i++) {
-		scaled[i] = kSizes[i] * static_cast<uint32_t>(scale);
+		scaled[i] = kAstroCbSizes[i] * static_cast<uint32_t>(option.scale);
 	}
 	std::memcpy(reinterpret_cast<void*>(address), scaled, sizeof(scaled));
 	::printf("Game patch: Astro Bot draw-thread command buffers x%d (%u, %u, %u, %u, %u MiB; "
 	         "KYTY_ASTRO_CB_SCALE)\n",
-	         scale, scaled[0], scaled[1], scaled[2], scaled[3], scaled[4]);
+	         option.scale, scaled[0], scaled[1], scaled[2], scaled[3], scaled[4]);
 }
 
 void Clear() {

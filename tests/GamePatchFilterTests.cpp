@@ -1,7 +1,9 @@
 #include "loader/gamePatchFilter.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -115,6 +117,39 @@ void TestFileDisabled() {
 	      "a file without mods reports every pattern as unmatched");
 }
 
+void TestAstroCommandBufferTable() {
+	const auto unset = ParseAstroCbScale(nullptr);
+	Check(unset.scale == 2 && !unset.explicit_value, "an unset scale is the default, not an opt-in");
+	Check(!ParseAstroCbScale("").explicit_value, "an empty scale is not an opt-in");
+	Check(!ParseAstroCbScale("x").explicit_value, "a non-numeric scale is ignored");
+	const auto three = ParseAstroCbScale("3");
+	Check(three.scale == 3 && three.explicit_value, "a set scale opts in");
+	Check(ParseAstroCbScale("0").scale == 1 && ParseAstroCbScale("9").scale == 4,
+	      "the scale is clamped to 1-4");
+
+	Check(IsAstroBotTitle("PPSA21567") && IsAstroBotTitle("PPSA21564"), "known Astro Bot builds");
+	Check(!IsAstroBotTitle("PPSA01325") && !IsAstroBotTitle(""), "other titles never match");
+
+	std::vector<uint8_t> memory(256, 0xCC);
+	size_t               first = 0;
+	Check(CountOccurrences(memory.data(), memory.size(), kAstroCbSizes, sizeof(kAstroCbSizes), 2,
+	                       &first) == 0,
+	      "no table, no match");
+	std::memcpy(memory.data() + 52, kAstroCbSizes, sizeof(kAstroCbSizes));
+	Check(CountOccurrences(memory.data(), memory.size(), kAstroCbSizes, sizeof(kAstroCbSizes), 2,
+	                       &first) == 1 &&
+	          first == 52,
+	      "one table is found at its offset");
+	std::memcpy(memory.data() + 200, kAstroCbSizes, sizeof(kAstroCbSizes));
+	Check(CountOccurrences(memory.data(), memory.size(), kAstroCbSizes, sizeof(kAstroCbSizes), 2,
+	                       &first) == 2 &&
+	          first == 52,
+	      "a second copy makes the scan ambiguous");
+	Check(CountOccurrences(memory.data(), 60, kAstroCbSizes, sizeof(kAstroCbSizes), 2, &first) ==
+	          0,
+	      "a table cut by the segment end does not match");
+}
+
 } // namespace
 
 int main() {
@@ -122,6 +157,7 @@ int main() {
 	TestMatch();
 	TestSelectAstro();
 	TestFileDisabled();
+	TestAstroCommandBufferTable();
 	std::printf("GamePatchFilterTests: all passed\n");
 	return 0;
 }
